@@ -1,5 +1,53 @@
 # Changelog
 
+## [0.5.1] — 2026-04-29 — Enable `bash` tool (gated by Slack prompts)
+
+`bash` was deliberately disabled in the v0.1 cut pending a real
+sandbox (§6.4 of the spec listed Docker-per-call, bubblewrap,
+and workspace ACLs as the candidate approaches). v0.5.1 enables
+it without those, on the basis that the v0.4.4 Slack permission
+prompt — Block Kit ✅/❌ on every call, with the actual command
+in the prompt body — is sufficient gating for the trusted-Slack-
+workspace deployment shape franky-do targets today.
+
+### Changes
+
+- `src/main.zig` tool registry now includes
+  `franky.coding.tools.bash.tool()` (the no-state factory).
+  No `SessionBashState` is wired today — cwd does not persist
+  across calls, and spill files land in
+  `/tmp/franky-bash-<call_id>.log`. Per-session state is a
+  follow-up.
+- Bumps the franky compat floor to **v1.29.5** for the
+  `.git/` hard-skip in `ls` / `find` (without it, an LLM-
+  driven `ls -R` from repo root floods context with git
+  object hashes).
+- `franky-do.md` §6.3 row for `bash` flips from ❌ disabled to
+  ✅ enabled with a one-line summary of the safety story.
+  §6.4 prose rewritten as the "current bash safety model"
+  rather than the "why bash is disabled" rationale.
+
+### Safety notes
+
+- `prompts_enabled=true` is the default; only operators in
+  trusted Slack workspaces should run with `--no-prompts` /
+  `FRANKY_DO_PROMPTS=0`. With prompts off, bash auto-executes.
+- The "always allow" button on a bash prompt is keyed on the
+  **verb fingerprint** (`rm`, `git`, `find`, etc. — see
+  `permissions.fingerprintBash`), not the full command. One
+  click of "always allow rm" silences future `rm -rf /` prompts
+  too. Treat that button as a per-verb gate.
+- Bot's UID bounds reachability. Run as a dedicated unprivileged
+  UID with no rights outside the workspace dir.
+
+### Other
+
+- Restored `default_model_id` constant and `resolvePromptsEnabled`
+  function in `main.zig` — both had been deleted alongside an
+  unrelated `resolveModelId` cleanup but still had live callers
+  (compile errors at the same time as this v0.5.1 work).
+  `default_model_id = "claude-sonnet-4-5"` matches the prior value.
+
 ## [0.5.0] — 2026-04-29 — postMessage-only flow (no placeholder, no chat.update)
 
 The four iterations of v0.4.12-v0.4.14 fixing the chronological-

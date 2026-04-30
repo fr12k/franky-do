@@ -398,7 +398,7 @@ The seven `franky.coding.tools` registered with each `Agent`:
 | `ls` | ✅ enabled | Tree view, gitignore-aware |
 | `find` | ✅ enabled | Glob |
 | `grep` | ✅ enabled | Regex / literal |
-| `bash` | ❌ disabled | Returns immediately. Re-enable after sandboxing (§6.4 + Phase 6+) |
+| `bash` | ✅ enabled (v0.5.1) | Stateless `bash.tool()`. **Sole safety layer is the v0.4.4 Slack permission prompt** — `prompts_enabled=true` (default) gates every call behind a Block Kit ✅/❌. The full sandbox roadmap (§6.4) is still future work |
 
 All tools operate against `$FRANKY_DO_WORKSPACE` (default:
 `$FRANKY_DO_HOME/workspace`), **not** the host's home or the
@@ -408,16 +408,30 @@ Per-thread filesystem isolation is post-1.0.
 
 ### §6.4 Bash and sandboxing
 
-Bash is disabled in v0.1 by registering a stub tool that returns:
+**v0.5.1 status: bash is enabled** (`franky.coding.tools.bash.tool()`,
+no per-session state, no workspace check). The sole safety layer
+is the v0.4.4 Slack permission prompt — every call surfaces a
+Block Kit message with the actual command in `cmd` and ✅/❌
+buttons; nothing executes until an operator clicks ✅.
 
-> `bash is disabled in this franky-do build. See §6.4 of the spec
-> for details.`
+What that means in practice:
 
-The stub stays in the tool registry so the model knows the tool
-exists; it just always errors. This is preferable to silently
-hiding the tool (the model will keep trying to use it).
+- `prompts_enabled=true` is the **default** (`--no-prompts` /
+  `FRANKY_DO_PROMPTS=0` flips it off — don't, with bash enabled).
+- The "always allow" button on a bash prompt is fingerprint-keyed
+  on the **verb** (e.g. `rm`, `git`, `find`). Clicking it once for
+  `rm -rf /tmp/scratch` silences future prompts for `rm`-anything,
+  including `rm -rf /`. Treat that button as a per-verb gate, not
+  a per-command one.
+- The bot's UID is what bounds reachability. `rm -rf $HOME` is
+  bot-UID-scoped damage; `rm -rf /etc` requires root. Run the bot
+  as a dedicated UID with no rights outside the workspace dir
+  ("Workspace ACL hardening" below) for a real safety floor.
+- Spill files land in `/tmp/franky-bash-<call_id>.log` (no
+  per-session `bash_state` is wired today; v1.27.x's session-dir
+  spill is a follow-up — see v2 roadmap).
 
-Re-enabling bash needs a real sandbox. The shortlist of approaches:
+The full sandbox roadmap is still open. Shortlist:
 
 - **Docker per call**: spin up a container per `bash` invocation with
   a read-only mount of the workspace and `--rm`. Heavy but bulletproof.
@@ -428,7 +442,10 @@ Re-enabling bash needs a real sandbox. The shortlist of approaches:
   but doesn't stop network egress.
 
 The decision belongs to whoever's running the bot in production.
-Phase 6 will ship the Docker variant as the default.
+A future minor will ship one of these (most likely the Docker or
+ACL variant) as the default. Until then: keep the Slack prompt
+on, run the bot as an unprivileged UID, and don't click "always
+allow" on bash prompts unless you really mean it.
 
 ---
 
@@ -1019,7 +1036,10 @@ not an implicit one.
 
 ### Compatibility window
 
-The current cut (`v0.5.0`) requires franky **v1.29.4** for the
+The current cut (`v0.5.1`) requires franky **v1.29.5** for the
+`.git/` hard-skip in `ls`/`find` (otherwise a recursive ls or
+broad-glob find from a repo root floods the LLM context with git
+object hashes). It also still requires the
 proxy-UAF fix (any operator running behind `HTTPS_PROXY` will
 segfault on franky ≤ v1.29.3 — see CHANGELOG `[0.4.8]` /
 franky's `[v1.29.4]` for the diagnosis).
@@ -1876,10 +1896,11 @@ dominant wait.
   a click.
 - **Long-reply file-attachment fallback** (§22.5). Now
   applied per-message at post time instead of mid-stream.
-- **Compatibility window.** Still requires franky **v1.29.4**
-  for the proxy-UAF fix, the `Message.diagnostics` field
-  (currently unused in v0.5.0 but kept by `web_api.zig`),
-  and the `--http-trace-dir` plumbing.
+- **Compatibility window.** Now requires franky **v1.29.5** for
+  the `.git/` hard-skip in `ls`/`find`, on top of v1.29.4's
+  proxy-UAF fix and the `Message.diagnostics` field (currently
+  unused in v0.5.x but kept by `web_api.zig` for the
+  `--http-trace-dir` plumbing).
 
 ### Cost: no partial visibility
 

@@ -25,7 +25,7 @@ pub const auth = @import("auth.zig");
 pub const pricing = @import("pricing.zig");
 pub const stats = @import("stats.zig");
 
-pub const version = "0.5.0";
+pub const version = "0.5.1";
 
 const usage =
     \\franky-do — Slack agent bot
@@ -489,7 +489,16 @@ fn cmdRun(
         franky.coding.tools.ls.tool(),
         franky.coding.tools.find.tool(),
         franky.coding.tools.grep.tool(),
-        // bash deliberately omitted in v0.1 — see franky-do.md §6.4
+        // v0.5.1 — bash enabled. Stateless `bash.tool()` factory:
+        // no per-session cwd persistence, no workspace path-safety,
+        // spill files land in `/tmp/franky-bash-<call_id>.log`. The
+        // sole safety layer is the v0.4.4 Slack permission prompt
+        // (Block Kit ✅/❌ on every call). See §6.4 of the spec for
+        // the sandbox roadmap; until that lands, only enable
+        // `--ask-all=false` (i.e. the default) in trusted Slack
+        // workspaces — the model can `rm -rf` whatever the bot's
+        // UID can reach if an operator click-through misfires.
+        franky.coding.tools.bash.tool(),
     };
     {
         // Audit-log the registered tool surface at info so operators
@@ -1095,29 +1104,9 @@ fn nanoSleepInterruptible(ms: u64, stop_flag: *std.atomic.Value(bool)) void {
     }
 }
 
-/// Resolve the model id to feed `bot.Config.model_id`. Precedence:
-///
-///   1. CLI flag `--model <id>` (per-run override; cmdRun only)
-///   2. Env var `FRANKY_DO_MODEL` (works for `run` and `run --all`)
-///   3. Built-in default `default_model_id`
-///
-/// Returns a borrowed slice — caller does not free. The CLI arg
-/// is owned by the args list (lives as long as cmdRun); the env
-/// value is owned by the parent environ. The default is a static
-/// constant.
-///
-/// **Future:** v0.3 plans to replace this with a full reuse of
-/// franky's profile system (`franky.coding.profiles`) so a single
-/// `--profile <name>` resolves provider + model + base_url +
-/// api_key_env in one shot, sharing the same settings.json
-/// catalog as the franky CLI. See `franky-do.md` §7.
+/// Built-in default model id, used when no `--model` flag and no
+/// `FRANKY_DO_MODEL` env var is set.
 const default_model_id: []const u8 = "claude-sonnet-4-5";
-
-fn resolveModelId(environ: std.process.Environ, flag_arg: ?[]const u8) []const u8 {
-    if (flag_arg) |m| if (m.len > 0) return m;
-    if (environ.getPosix("FRANKY_DO_MODEL")) |m| if (m.len > 0) return m;
-    return default_model_id;
-}
 
 /// v0.3.2 — opt-out resolver for the permission overlay (design
 /// §B.3.1). Default = enabled. Disabled when EITHER the
@@ -1318,7 +1307,7 @@ test "phase 0: franky version is a non-empty string" {
 }
 
 test "phase 0: our own version constant is set" {
-    try testing.expectEqualStrings("0.5.0", version);
+    try testing.expectEqualStrings("0.5.1", version);
 }
 
 // ─── v0.4.3 — resolveAskAll precedence tests ──────────────────────
