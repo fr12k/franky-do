@@ -1,0 +1,91 @@
+# franky-do — Slack App Manifest
+#
+# Paste this YAML into https://api.slack.com/apps → "Create New App"
+# → "From a manifest" to provision the app's display info, bot user,
+# OAuth scopes, event subscriptions, slash command, and Socket Mode
+# in one shot. Replaces TESTING.md steps 2 through 5 of the manual
+# click-through path.
+#
+# After creating the app, you still need to:
+#   1. Generate an App-Level Token under "Basic Information"
+#      → "App-Level Tokens" with the `connections:write` scope
+#      (this isn't expressible in the manifest schema). Copy the
+#      `xapp-…` value — your `SLACK_APP_TOKEN`.
+#   2. Click "Install to Workspace" under "Install App". Copy the
+#      `xoxb-…` Bot User OAuth Token — your `SLACK_BOT_TOKEN`.
+#   3. Invite the bot to a channel: `/invite @franky-do`.
+#
+# Schema reference: https://api.slack.com/reference/manifests
+# Manifest version: 1 (major), Slack's current stable.
+
+_metadata:
+  major_version: 1
+  minor_version: 1
+
+display_information:
+  name: Franky-Do
+  description: A coding agent in your Slack thread.
+  long_description: |
+    franky-do drives one stateful coding agent per Slack thread.
+    `@`-mention the bot to start; subsequent messages in the same
+    thread share context. Tools include read / write / edit / ls /
+    find / grep over a sandboxed workspace. React with :x: to
+    abort an in-flight turn, or :leftwards_arrow_with_hook: to
+    re-run the last prompt. Use `/franky-do stats` for token + cost
+    visibility.
+    Built on the franky SDK (https://github.com/afshinm/franky).
+  background_color: "#3F3F3F"
+
+features:
+  app_home:
+    home_tab_enabled: true
+    messages_tab_enabled: false
+    messages_tab_read_only_enabled: false
+  bot_user:
+    display_name: Franky-Do
+    always_online: false
+  slash_commands:
+    - command: /franky-do
+      description: Let interact with franky-do
+      usage_hint: reset | help
+      should_escape: false
+
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read
+      - channels:history
+      - chat:write
+      - commands
+      - im:history
+      - im:read
+      - reactions:read
+      # v0.3.0 — needed for emoji status indicators on the user's
+      # @-mention message (👀 received / 💭 working / ✅ done / ❌ error).
+      # Requires app reinstall when upgrading from v0.2.x.
+      - reactions:write
+      # v0.4.10 — long-reply file-attachment fallback. When a streamed
+      # reply exceeds Slack's ~3500B chat.update limit, the bot
+      # spills to `files.uploadV2` (3-step: getUploadURLExternal →
+      # presigned PUT → completeUploadExternal). Without this scope
+      # `completeUploadExternal` returns the (deceptively unhelpful)
+      # `invalid_arguments` error. Requires app reinstall when
+      # upgrading from v0.4.9 or earlier.
+      - files:write
+
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_mention
+      - message.im
+      - reaction_added
+  interactivity:
+    is_enabled: true
+  org_deploy_enabled: false
+  # Socket Mode bot — no public ingress required. Pair with an
+  # App-Level Token (`xapp-…`) generated under Basic Information.
+  socket_mode_enabled: true
+  # Long-lived bot token rotation is post-1.0 (Phase 9+). Keep
+  # off until we add the rotation handler.
+  token_rotation_enabled: false
+  is_mcp_enabled: false
