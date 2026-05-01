@@ -1036,8 +1036,12 @@ not an implicit one.
 
 ### Compatibility window
 
-The current cut (`v0.5.4`) requires franky **v1.29.6** for the
-`Options.provider` / `Options.model` fields on
+The current cut (`v0.5.5`) requires franky **v1.29.7** for the
+breaking `setupClientFromEnv` signature change (returns
+`!std.heap.ArenaAllocator` instead of `!void`) — the proper
+fix for the v1.29.4 ~100B-per-call proxy leak, replacing it
+with a caller-owned arena that deinits in lockstep with the
+client. v1.29.6 added `Options.provider` / `Options.model` on
 `coding.diagnostics` (consumed by `bot.zig`'s
 `runDiagnosticsReaction` to render `provider:` / `model:` in
 the report header) and the sharper per-tool-error hints
@@ -1902,13 +1906,13 @@ dominant wait.
   a click.
 - **Long-reply file-attachment fallback** (§22.5). Now
   applied per-message at post time instead of mid-stream.
-- **Compatibility window.** Now requires franky **v1.29.6** for
-  the `Options.provider` / `Options.model` fields on
-  `coding.diagnostics` (rendered in the `/diagnostics` header
-  by v0.5.3) plus the sharper per-tool-error hints; on top of
-  v1.29.5's `.git/` hard-skip in `ls`/`find` and v1.29.4's
-  proxy-UAF fix. The `Message.diagnostics` field carries the
-  `--http-trace-dir` trace_id through `web_api.zig`.
+- **Compatibility window.** Now requires franky **v1.29.7**
+  for the proxy-arena lifetime fix (`setupClientFromEnv`
+  returns the arena), on top of v1.29.6's diagnostics
+  provider/model + sharper hints, v1.29.5's `.git/` hard-skip
+  in `ls`/`find`, and v1.29.4's proxy-UAF fix. The
+  `Message.diagnostics` field carries the `--http-trace-dir`
+  trace_id through `web_api.zig`.
 
 ### Cost: no partial visibility
 

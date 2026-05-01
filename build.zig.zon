@@ -1,12 +1,12 @@
 .{
     .name = .franky_do,
     .fingerprint = 0x7b9341bbed601e6d,
-    .version = "0.5.4",
+    .version = "0.5.5",
     .minimum_zig_version = "0.17.0-dev",
     .dependencies = .{
         .franky = .{
-            .url = "https://github.com/fr12k/franky/archive/d24d9053947ab238fb85ef5f218c78128cdcb188.tar.gz",
-            .hash = "franky-1.29.6-MZKCXRtEIwBmHcyF_LazeQaUpZ6HLGoObryjJ2HG___E",
+            .url = "https://github.com/fr12k/franky/archive/2ceda835d65ac41fa98ecf1b0dc9cb1f867f88cf.tar.gz",
+            .hash = "franky-1.29.7-MZKCXStUIwC8yGRogfTY-FgaK8XXiUoq6bPJ0upzhQgq",
         },
         // .franky = .{
         //     .path = "../franky",

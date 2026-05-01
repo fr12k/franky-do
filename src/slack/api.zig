@@ -159,12 +159,20 @@ pub const Client = struct {
             .allocator = self.allocator,
             .io = self.io,
         };
-        defer http_client.deinit();
+        // v0.5.5 — `setupClientFromEnv` returns a proxy arena that
+        // must outlive the client (franky v1.29.7). Single defer
+        // block pins the order: client.deinit() first (uses proxy
+        // pointers — still alive), then the arena (frees them).
+        var proxy_arena: ?std.heap.ArenaAllocator = null;
+        defer {
+            http_client.deinit();
+            if (proxy_arena) |*a| a.deinit();
+        }
 
         // v0.3.9/v0.4.0 — proxy + FRANKY_CA_BUNDLE in one call.
         // Same helper the LLM providers use (franky v1.25.0).
         if (self.environ_map) |env_map| {
-            http.setupClientFromEnv(&http_client, self.allocator, self.io, env_map) catch |e| {
+            proxy_arena = http.setupClientFromEnv(&http_client, self.allocator, self.io, env_map) catch |e| {
                 self.last_http_error = e;
                 return ApiError.HttpFailed;
             };
@@ -552,12 +560,18 @@ pub const Client = struct {
         var bw = std.Io.Writer.Allocating.init(self.allocator);
         defer bw.deinit();
         var http_client = franky.ai.http.Client{ .allocator = self.allocator, .io = self.io };
-        defer http_client.deinit();
+        // v0.5.5 — proxy arena outlives the client; see the
+        // top-of-file callMethod for the full lifetime rationale.
+        var proxy_arena: ?std.heap.ArenaAllocator = null;
+        defer {
+            http_client.deinit();
+            if (proxy_arena) |*a| a.deinit();
+        }
         // v0.3.9/v0.4.0 — proxy + FRANKY_CA_BUNDLE for the file-
         // upload step too; the presigned URL host hits the same
         // MITM proxy as the /api/* endpoints.
         if (self.environ_map) |env_map| {
-            http.setupClientFromEnv(&http_client, self.allocator, self.io, env_map) catch |e| {
+            proxy_arena = http.setupClientFromEnv(&http_client, self.allocator, self.io, env_map) catch |e| {
                 self.last_http_error = e;
                 return ApiError.HttpFailed;
             };

@@ -25,7 +25,7 @@ pub const auth = @import("auth.zig");
 pub const pricing = @import("pricing.zig");
 pub const stats = @import("stats.zig");
 
-pub const version = "0.5.4";
+pub const version = "0.5.5";
 
 const usage =
     \\franky-do — Slack agent bot
@@ -1101,7 +1101,7 @@ test "phase 0: franky version is a non-empty string" {
 }
 
 test "phase 0: our own version constant is set" {
-    try testing.expectEqualStrings("0.5.4", version);
+    try testing.expectEqualStrings("0.5.5", version);
 }
 
 // ─── v0.4.3 — resolveAskAll precedence tests ──────────────────────

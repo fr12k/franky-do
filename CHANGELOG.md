@@ -1,5 +1,59 @@
 # Changelog
 
+## [0.5.5] — 2026-04-29 — Fix proxy-arena leak (franky v1.29.7 lockstep)
+
+Pairs with **franky v1.29.7**, which closes the v1.29.4
+"~100 bytes per HTTP call" leak documented under
+`createProxyFromEnvVar` in DebugAllocator runs. The fix
+honors the upstream `Client.initDefaultProxies` contract
+literally: `setupClientFromEnv` now creates an `ArenaAllocator`
+internally, returns it to the caller, and the caller pairs
+the arena's deinit with the client's via a single `defer`
+block — client first (uses proxy pointers), arena second
+(frees them).
+
+### Change
+
+Both Slack-API call sites in `src/slack/api.zig`
+(`callMethod` for `/api/*` endpoints, `multipart/form-data`
+upload for `files.upload`) switched from:
+
+```zig
+defer http_client.deinit();
+http.setupClientFromEnv(&http_client, allocator, io, env_map) catch ...;
+```
+
+to:
+
+```zig
+var proxy_arena: ?std.heap.ArenaAllocator = null;
+defer {
+    http_client.deinit();
+    if (proxy_arena) |*a| a.deinit();
+}
+proxy_arena = http.setupClientFromEnv(&http_client, allocator, io, env_map) catch ...;
+```
+
+`?ArenaAllocator` so the arena can stay null on the no-proxy
+path (`environ_map == null`).
+
+### Compat floor
+
+Now requires **franky v1.29.7** for the breaking
+`setupClientFromEnv` signature change (returns
+`!ArenaAllocator` instead of `!void`). franky's CHANGELOG
+calls out that this is the FIRST non-additive SDK change in
+the v1.27.x – v1.29.x window; franky-do is the only known
+downstream consumer, and we update in lockstep.
+
+### Drive-by
+
+The CHANGELOG row for v0.5.4 noted that ~26 of the leak
+reports were the documented v1.29.4 trade-off. Those are
+gone after this bundle. The remaining real leak class
+(`slack/prompts.zig` timeout-thread args at process exit)
+was already closed by v0.5.4's `Io.Event` cancel mechanism.
+
 ## [0.5.4] — 2026-04-29 — Fix prompt-timeout thread leak
 
 A real-world DebugAllocator run reported 9 leaks across 3
