@@ -1036,13 +1036,19 @@ not an implicit one.
 
 ### Compatibility window
 
-The current cut (`v0.5.1`) requires franky **v1.29.5** for the
+The current cut (`v0.5.4`) requires franky **v1.29.6** for the
+`Options.provider` / `Options.model` fields on
+`coding.diagnostics` (consumed by `bot.zig`'s
+`runDiagnosticsReaction` to render `provider:` / `model:` in
+the report header) and the sharper per-tool-error hints
+(anti-widening `edit_no_match`, dedicated `edit_ambiguous` /
+`write_exists` / `invalid_args` recoveries). v1.29.5 added the
 `.git/` hard-skip in `ls`/`find` (otherwise a recursive ls or
 broad-glob find from a repo root floods the LLM context with git
-object hashes). It also still requires the
-proxy-UAF fix (any operator running behind `HTTPS_PROXY` will
-segfault on franky ≤ v1.29.3 — see CHANGELOG `[0.4.8]` /
-franky's `[v1.29.4]` for the diagnosis).
+object hashes). v1.29.4 fixed a proxy use-after-free (any
+operator running behind `HTTPS_PROXY` segfaults on franky ≤
+v1.29.3 — see CHANGELOG `[0.4.8]` / franky's `[v1.29.4]` for
+the diagnosis).
 
 Every franky release in the v1.27.x – v1.29.x window is additive
 on the SDK boundary (`franky.sdk` / `franky.ai` / `franky.agent` /
@@ -1896,11 +1902,13 @@ dominant wait.
   a click.
 - **Long-reply file-attachment fallback** (§22.5). Now
   applied per-message at post time instead of mid-stream.
-- **Compatibility window.** Now requires franky **v1.29.5** for
-  the `.git/` hard-skip in `ls`/`find`, on top of v1.29.4's
-  proxy-UAF fix and the `Message.diagnostics` field (currently
-  unused in v0.5.x but kept by `web_api.zig` for the
-  `--http-trace-dir` plumbing).
+- **Compatibility window.** Now requires franky **v1.29.6** for
+  the `Options.provider` / `Options.model` fields on
+  `coding.diagnostics` (rendered in the `/diagnostics` header
+  by v0.5.3) plus the sharper per-tool-error hints; on top of
+  v1.29.5's `.git/` hard-skip in `ls`/`find` and v1.29.4's
+  proxy-UAF fix. The `Message.diagnostics` field carries the
+  `--http-trace-dir` trace_id through `web_api.zig`.
 
 ### Cost: no partial visibility
 

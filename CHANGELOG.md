@@ -1,5 +1,194 @@
 # Changelog
 
+## [0.5.4] — 2026-04-29 — Fix prompt-timeout thread leak
+
+A real-world DebugAllocator run reported 9 leaks across 3
+resolved permission prompts:
+
+- 3× `TimeoutArgs` heap allocation
+- 3× duped `channel` string
+- 3× duped `prompt_ts` string
+
+All from `slack/prompts.zig:handleRequest` → `timeoutMain`.
+The pattern: `timeoutMain` correctly frees its args via `defer`
+on exit — but the function body called `sleepMs(args.timeout_ms)`,
+which is the **default 600_000 ms (10 minutes)**. Any prompt
+the user resolved via ✅/❌ click resolved the prompt
+immediately; its timeout thread kept sleeping for the full 10
+minutes regardless. Process exit before that deadline left the
+thread parked in `nanosleep`, never reaching its `defer` —
+hence the leaked args. The other proxy-related leaks reported
+in the same DebugAllocator output are the documented v1.29.4
+trade-off (Proxy struct has no destructor; ~100 bytes per HTTP
+call, fixed at v2.x), not new bugs.
+
+### Fix
+
+Replace `sleepMs` with an interruptible wait on a shared
+wakeup signal:
+
+- New `Orchestrator.cancel: std.Io.Event` (initial state
+  `.unset`).
+- New `Orchestrator.timeout_threads: std.ArrayList(std.Thread)`
+  — joinable handles instead of detached threads, so we can
+  actually wait for cleanup at shutdown.
+- `TimeoutArgs.cancel: *std.Io.Event` — borrowed pointer to
+  the orchestrator's event.
+- `timeoutMain` now `args.cancel.waitTimeout(io, .{ .duration =
+  ... })` instead of `sleepMs`. Both branches (timeout fired
+  vs. canceled) fall through to `tryTimeoutResolve`, which
+  was already a no-op for resolved prompts.
+- `Orchestrator.stop()` calls `cancel.set(io)` to wake all
+  parked threads, then joins them and frees the tracking
+  list — so each thread's `defer` runs to completion before
+  process exit.
+
+The (now-unused) `sleepMs` helper was removed.
+
+### Drive-by
+
+`stream.zig` and `bot.zig` tests were searching for lowercase
+`"in:"` / `"out:"` / `"turns:"` in the usage-summary post body,
+but the format string had been edited externally to use capital
+labels (`"Token in: N · Token out: M · Turns: K"`). Updated
+the assertions to match. **117/117 tests pass.**
+
+### Caveat — process-exit cleanup is best-effort
+
+The DebugAllocator runs at process exit, after `Orchestrator`
+deinit. If a future change moves the orchestrator out of the
+deinit chain (e.g. a forced shutdown path), parked timeout
+threads would leak again. The current shape is safe because
+every `handleAppMention` instantiates one orchestrator and
+defers `stop` + `deinit` on every exit path.
+
+## [0.5.3] — 2026-04-29 — `/diagnostics` shows provider + model
+
+Pairs with **franky v1.29.6**. The `/diagnostics` report header
+now includes the configured provider and model, so anyone
+reading a Slack thread's diagnostics output knows immediately
+which provider's quirks to suspect (Gemini's thinking-budget
+exhaustion vs OpenAI's tool-call shape vs Anthropic's stop
+reasons).
+
+### Change
+
+- `bot.zig`'s `runDiagnosticsReaction` now sets
+  `Options.provider = self.cfg.model_provider` and
+  `Options.model = self.cfg.model_id` when constructing the
+  diagnostics options. Both are static for the bot lifetime
+  (one provider + one model id pinned per `cmdRun`
+  invocation).
+- Bumps the franky compat floor to **v1.29.6** for the new
+  `Options.provider` / `Options.model` fields.
+
+### Sample header (after this change)
+
+```
+=== franky diagnostics ===
+mode:        franky-do
+session:     01KQFWZ1J248NMNHFK0GAEAB5H
+provider:    google
+model:       gemini-2.5-pro
+trace dir:   /home/agent/.franky-do/log-trace
+reducer dir: workspaces/T01FJ263RD1/sessions/01KQFWZ1J248NMNHFK0GAEAB5H
+transcript:  54 assistant turns / 109 messages
+```
+
+### Bundled franky-side improvements (v1.29.6)
+
+The franky bump ALSO sharpens the per-tool-error hints, which
+were being mis-followed by gemini-2.5-pro:
+
+- `edit_no_match` now explicitly tells the model **DO NOT
+  widen `old`** (the existing hint said "read the file
+  again" and Gemini was reading that as "widen with more
+  context" — making it worse on every retry).
+- `edit_ambiguous` is the OPPOSITE recovery — widen `old`
+  with surrounding context until uniquely matching. Now has
+  its own dedicated hint instead of falling through to the
+  generic one.
+- `write_exists` points at `overwrite: true` AND suggests
+  the `edit` tool as an alternative.
+- `invalid_args` points at the error message body (which
+  always names the bad/missing field).
+
+These show up in `/diagnostics` output the next time the bot
+hits one of those errors. See franky's `[v1.29.6]` row for
+the full diagnosis.
+
+## [0.5.2] — 2026-04-29 — End-of-run usage summary in Slack
+
+After every `@`-mention completes, franky-do now posts one
+trailing bubble of the form `_in: 5400 · out: 1100 · turns: 4_`
+so the user can see the LLM cost at a glance without leaving
+Slack. No cache_read counts, no dollar figures — just the three
+numbers that matter for skimming.
+
+### How it's computed
+
+- `total_input` / `total_output` are summed from
+  `Message.usage.{input,output}` on every
+  `message_end{role=.assistant}`. The provider parser
+  populates `usage` for the assistant turn; tool_result rows
+  are synthesized locally and don't carry LLM-side counts, so
+  they're skipped naturally.
+- `turn_count` increments on every `turn_start` agent-loop
+  event — that's once per model round-trip, so a 1-tool run
+  reports `turns: 2` (assistant text + tool call, then
+  assistant final response), matching operator intuition.
+- The summary post fires from `bot.zig` after
+  `agent.waitForIdle`, BEFORE the reply-anchor drain — so the
+  summary bubble's `ts` also lands in `posted_ts` and gets
+  anchored, meaning users can react `:x:` / `:mag:` on it
+  too if they want.
+- No-op when `turn_count == 0` (e.g. setup error before
+  `agent.prompt`). Cleanly silent on those.
+
+### Why no cache_read or cost
+
+The user explicitly asked for in/out/turns only. Cache reads
+clutter short-turn summaries and the dollar figure depends on
+`pricing.lookup(model_id)` returning a value (not every model
+is in the table). The `franky-do stats` subcommand still
+covers cost when you want it, including across persisted
+sessions.
+
+### Tests
+
+Two new tests in `src/subscribers/stream.zig`:
+
+- `flushUsageSummary posts in/out/turns totals after a multi-turn run`
+  — fires `turn_start` + `message_end{usage:{input,output}}`
+  twice, asserts `total_input=2000`, `total_output=590`,
+  `turn_count=2`. Calls `flushUsageSummary()`, asserts a third
+  post landed with body containing `in: 2000`, `out: 590`,
+  `turns: 2`, AND no `cache` / `$` substring.
+- `flushUsageSummary is a no-op when no turn ran` — bare
+  subscriber, no events, summary call ⇒ zero posts.
+
+The bot.zig integration test (`Bot.handleAppMention: end-to-end
+posts assistant text per message_end`) updated to expect 2
+chat.postMessage calls (answer + summary) instead of 1, and
+asserts the summary contains `turns: 1` for a single-turn run.
+
+### Drive-by
+
+Fixed two pre-existing breakages from your file reorg that
+landed alongside this work:
+
+- Duplicate `franky_do_slack` struct (one at the top of
+  `main.zig` pointing at the new `slack/api.zig` /
+  `slack/socket.zig` paths, one further down still pointing
+  at the deleted `slack/web_api.zig` / `slack/socket_mode.zig`).
+  Dropped the stale one.
+- Two unused locals (`prompts_enabled`, `ask_all`) in
+  `cmdRun` shadowing the same names that `setupAndRunBot`
+  recomputes from the same flags. Replaced with a comment
+  noting where the resolution actually happens.
+
+**117/117 tests passing** (was 115; +2).
+
 ## [0.5.1] — 2026-04-29 — Enable `bash` tool (gated by Slack prompts)
 
 `bash` was deliberately disabled in the v0.1 cut pending a real

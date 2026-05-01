@@ -33,7 +33,7 @@ const std = @import("std");
 const franky = @import("franky");
 const at = franky.agent.types;
 const ai = franky.ai;
-const web_api = @import("slack/web_api.zig");
+const web_api = @import("../slack/api.zig");
 
 pub const Terminal = enum { success, error_state };
 

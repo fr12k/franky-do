@@ -34,8 +34,8 @@
 
 const std = @import("std");
 const franky = @import("franky");
-const slack_web_api = @import("slack/web_api.zig");
-const prompts_state = @import("prompts_state.zig");
+const slack_web_api = @import("api.zig");
+const prompts_state = @import("../prompts_state.zig");
 
 const at = franky.agent.types;
 const loop_mod = franky.agent.loop;
@@ -72,6 +72,29 @@ pub const Orchestrator = struct {
     /// followed by single-reader (stop, after join) — no mutex
     /// needed.
     registered_prompts: std.ArrayList([]u8) = .empty,
+
+    /// v0.5.4 — wakeup signal for parked timeout threads. Each
+    /// timeout thread waits on `cancel.waitTimeout(io, …)` instead
+    /// of `sleepMs`. On `stop()` we `cancel.set(io)` so all parked
+    /// threads return immediately, run `tryTimeoutResolve` (a
+    /// no-op for already-resolved prompts), and free their
+    /// `TimeoutArgs` via the existing `defer` block.
+    ///
+    /// Without this, the 10-minute default timeout meant any
+    /// timeout thread for a prompt resolved-by-click sat parked
+    /// in `nanosleep` until process exit — leaking
+    /// `TimeoutArgs` + duped `channel` + duped `prompt_ts`
+    /// (3 leaks per prompt; real-world bot reports of 9 leaks
+    /// across 3 resolved prompts).
+    cancel: std.Io.Event = .unset,
+
+    /// v0.5.4 — joinable timeout threads spawned per prompt.
+    /// Drained on `stop()` after `cancel.set()` so each thread
+    /// gets a chance to run its `defer` cleanup. Single-writer
+    /// (drain thread, in `handleRequest`) → single-reader (stop,
+    /// after the drain thread joins) so no mutex is needed —
+    /// same ordering invariant as `registered_prompts`.
+    timeout_threads: std.ArrayList(std.Thread) = .empty,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -150,6 +173,20 @@ pub const Orchestrator = struct {
             t.join();
             self.drain_thread = null;
         }
+
+        // v0.5.4 — wake all parked timeout threads. Each one's
+        // `waitTimeout` returns, `tryTimeoutResolve` runs (no-op
+        // for resolved prompts), the `defer` in `timeoutMain`
+        // frees the per-thread `TimeoutArgs` + duped strings.
+        // Joining waits for each thread to actually finish, so
+        // a leak-detector at process exit doesn't see the
+        // still-running cleanup. Safe ordering: `drain_thread`
+        // is the only writer to `timeout_threads`, and we joined
+        // it above.
+        self.cancel.set(self.io);
+        for (self.timeout_threads.items) |t| t.join();
+        self.timeout_threads.deinit(self.allocator);
+        self.timeout_threads = .empty;
 
         // Scrub any orphan entries — these are prompts we
         // registered that never got resolved (which shouldn't
@@ -270,22 +307,36 @@ fn handleRequest(
         req.tool_name, req.call_id, self.channel, prompt_ts, self.timeout_ms,
     });
 
-    // Spawn the timeout thread. Detached — the timer is
-    // single-shot, completes quickly once it fires, and the
-    // `tryTimeoutResolve` no-ops if the user already reacted.
+    // Spawn the timeout thread. v0.5.4 — joinable, not detached:
+    // `Orchestrator.stop` joins all of these after signaling
+    // `cancel` so the per-thread `TimeoutArgs` always gets freed
+    // (pre-fix, a 10-minute default timeout left these parked in
+    // `nanosleep` until process exit, leaking 3 allocations per
+    // resolved prompt).
     const timeout_args = try self.allocator.create(TimeoutArgs);
     errdefer self.allocator.destroy(timeout_args);
+    const channel_dup = try self.allocator.dupe(u8, self.channel);
+    errdefer self.allocator.free(channel_dup);
+    const prompt_ts_dup = try self.allocator.dupe(u8, prompt_ts);
+    errdefer self.allocator.free(prompt_ts_dup);
     timeout_args.* = .{
         .allocator = self.allocator,
         .io = self.io,
         .api = self.api,
         .prompts_map = self.prompts_map,
-        .channel = try self.allocator.dupe(u8, self.channel),
-        .prompt_ts = try self.allocator.dupe(u8, prompt_ts),
+        .channel = channel_dup,
+        .prompt_ts = prompt_ts_dup,
         .timeout_ms = self.timeout_ms,
+        .cancel = &self.cancel,
     };
     const t = try std.Thread.spawn(.{}, timeoutMain, .{timeout_args});
-    t.detach();
+    self.timeout_threads.append(self.allocator, t) catch {
+        // Allocator failure on the tracking append: detach so the
+        // thread eventually frees its own args via `defer`. The
+        // process-exit leak in this rare path is bounded by how
+        // many appends fail, which is itself a degenerate case.
+        t.detach();
+    };
 }
 
 /// v0.4.4 — render the permission-prompt as a Block Kit blocks
@@ -535,6 +586,11 @@ const TimeoutArgs = struct {
     channel: []u8,
     prompt_ts: []u8,
     timeout_ms: u64,
+    /// v0.5.4 — borrowed pointer to the orchestrator's wakeup
+    /// event. `Orchestrator.stop` calls `cancel.set(io)` to wake
+    /// all parked timeout threads at shutdown so they can run
+    /// their `defer` cleanup before the process exits.
+    cancel: *std.Io.Event,
 };
 
 fn timeoutMain(args: *TimeoutArgs) void {
@@ -543,7 +599,20 @@ fn timeoutMain(args: *TimeoutArgs) void {
         args.allocator.free(args.prompt_ts);
         args.allocator.destroy(args);
     }
-    sleepMs(args.timeout_ms);
+    // v0.5.4 — wait for either the timeout deadline or an early
+    // wakeup (orchestrator stopping). Both branches fall through
+    // to `tryTimeoutResolve`, which is a no-op (returns
+    // `.already_resolved`) for prompts the user already clicked.
+    // Zig 0.17-dev `Io.Event.waitTimeout` takes a `Timeout`, whose
+    // `.duration` variant is a `Clock.Duration` = `{raw, clock}`.
+    // We use `.awake` (CLOCK_MONOTONIC on Linux) so a wall-clock
+    // jump can't shorten or extend the deadline.
+    const ns: i96 = @as(i96, args.timeout_ms) * std.time.ns_per_ms;
+    const wait_for: std.Io.Timeout = .{ .duration = .{
+        .raw = .fromNanoseconds(ns),
+        .clock = .awake,
+    } };
+    args.cancel.waitTimeout(args.io, wait_for) catch {};
 
     const out = args.prompts_map.tryTimeoutResolve(
         args.allocator,
@@ -572,18 +641,8 @@ fn timeoutMain(args: *TimeoutArgs) void {
     defer resp.deinit();
 }
 
-fn sleepMs(ms: u64) void {
-    if (@import("builtin").link_libc) {
-        const sec: i64 = @intCast(ms / 1000);
-        const nsec: i64 = @intCast((ms % 1000) * std.time.ns_per_ms);
-        const ts = std.c.timespec{ .sec = @intCast(sec), .nsec = @intCast(nsec) };
-        _ = std.c.nanosleep(&ts, null);
-        return;
-    }
-    const start = ai.stream.nowMillis();
-    const deadline = start + @as(i64, @intCast(ms));
-    while (ai.stream.nowMillis() < deadline) {}
-}
+// v0.5.4 — `sleepMs` removed; the timeout thread now blocks on
+// `ResetEvent.timedWait` (interruptible at shutdown).
 
 // ─── Tests ─────────────────────────────────────────────────────────
 

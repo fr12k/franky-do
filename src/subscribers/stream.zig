@@ -34,7 +34,7 @@ const std = @import("std");
 const franky = @import("franky");
 const at = franky.agent.types;
 const ai = franky.ai;
-const web_api = @import("slack/web_api.zig");
+const web_api = @import("../slack/api.zig");
 
 pub const Config = struct {
     /// Threshold above which a single message is posted as a file
@@ -76,6 +76,20 @@ pub const StreamSubscriber = struct {
     /// by the subscriber; drained by the bot after
     /// `agent.waitForIdle` to register reply anchors.
     posted_ts: std.ArrayList([]u8) = .empty,
+
+    /// v0.5.2 — token + turn aggregates for the end-of-run usage
+    /// summary. `total_input` / `total_output` accumulate from
+    /// `Message.usage` on every `message_end{role=.assistant}` (the
+    /// provider parser populates `usage` for the assistant turn;
+    /// tool_result rows are synthesized locally and don't carry
+    /// llm-side counts). `turn_count` increments on every
+    /// `turn_start` so it tracks model round-trips, not bubbles.
+    /// The bot calls `flushUsageSummary()` after `waitForIdle` to
+    /// post a single trailing bubble of the form
+    /// `_in: N · out: M · turns: K_`.
+    total_input: u64 = 0,
+    total_output: u64 = 0,
+    turn_count: u32 = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -124,6 +138,10 @@ pub const StreamSubscriber = struct {
             .tool_execution_end => |e| ai.log.log(.info, "franky-do", "stream_event", "tool_execution_end call_id={s} is_error={}", .{ e.call_id, e.result.is_error }),
             .message_end => |m| {
                 if (m.role != .assistant) return;
+                if (m.usage) |u| {
+                    self.total_input += u.input;
+                    self.total_output += u.output;
+                }
                 self.flushAssistantMessage();
             },
             .agent_error => |e| {
@@ -137,7 +155,10 @@ pub const StreamSubscriber = struct {
                 self.last_error_message = self.allocator.dupe(u8, e.message) catch null;
                 self.flushErrorReply();
             },
-            .turn_start => ai.log.log(.debug, "franky-do", "stream_event", "turn_start", .{}),
+            .turn_start => {
+                self.turn_count += 1;
+                ai.log.log(.debug, "franky-do", "stream_event", "turn_start count={d}", .{self.turn_count});
+            },
             .turn_end => ai.log.log(.debug, "franky-do", "stream_event", "turn_end", .{}),
             else => {},
         }
@@ -172,6 +193,25 @@ pub const StreamSubscriber = struct {
         ) catch return;
         defer self.allocator.free(composed);
         self.postInline(composed);
+    }
+
+    /// v0.5.2 — post one final bubble summarizing token usage and
+    /// turn count for the run. Called by the bot after
+    /// `agent.waitForIdle` (and intentionally also after the
+    /// terminal `agent_error` path so failed runs still get a
+    /// summary). No-op when nothing happened (`turn_count == 0`)
+    /// — that case means the agent never started, e.g. a setup
+    /// error before `agent.prompt`. Best-effort: a failed post is
+    /// logged and dropped.
+    pub fn flushUsageSummary(self: *StreamSubscriber) void {
+        if (self.turn_count == 0) return;
+        var buf: [128]u8 = undefined;
+        const text = std.fmt.bufPrint(
+            &buf,
+            "Token in: {d} · Token out: {d} · Turns: {d}_",
+            .{ self.total_input, self.total_output, self.turn_count },
+        ) catch return;
+        self.postInline(text);
     }
 
     fn postInline(self: *StreamSubscriber, text: []const u8) void {
@@ -651,4 +691,115 @@ test "StreamSubscriber: partial text + agent_error → two posts (text then erro
     try testing.expect(s.post_bodies.items.len == 2);
     try testing.expect(std.mem.indexOf(u8, s.post_bodies.items[0], "Partial answer cut sho") != null);
     try testing.expect(std.mem.indexOf(u8, s.post_bodies.items[1], "transport") != null);
+}
+
+test "StreamSubscriber: flushUsageSummary posts in/out/turns totals after a multi-turn run" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{
+        .argv0 = .empty,
+        .environ = .empty,
+    });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var s = bindTallyServer(gpa, io) orelse return;
+    defer deinitTallyServer(&s);
+    const server_thread = try std.Thread.spawn(.{}, tallyServerLoop, .{&s});
+    defer {
+        s.stop.store(true, .release);
+        wakeServer(io, s.port);
+        server_thread.join();
+    }
+
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/", .{s.port});
+    defer gpa.free(base);
+
+    var api = web_api.Client.init(gpa, io, "xoxb-fake");
+    defer api.deinit();
+    api.base_url = base;
+
+    var sub = StreamSubscriber.init(gpa, io, &api, "C1", "9999.0001", .{});
+    defer sub.deinit();
+
+    // Turn 1: assistant text + usage.
+    StreamSubscriber.onEvent(@ptrCast(&sub), .turn_start);
+    StreamSubscriber.onEvent(@ptrCast(&sub), .{ .message_start = .{ .role = .assistant } });
+    StreamSubscriber.onEvent(@ptrCast(&sub), .{ .message_update = .{ .text = .{
+        .block_index = 0,
+        .delta = "first turn",
+    } } });
+    StreamSubscriber.onEvent(@ptrCast(&sub), .{ .message_end = .{
+        .role = .assistant,
+        .content = &.{},
+        .timestamp = 0,
+        .usage = .{ .input = 1200, .output = 340 },
+    } });
+
+    // Turn 2: more usage.
+    StreamSubscriber.onEvent(@ptrCast(&sub), .turn_start);
+    StreamSubscriber.onEvent(@ptrCast(&sub), .{ .message_start = .{ .role = .assistant } });
+    StreamSubscriber.onEvent(@ptrCast(&sub), .{ .message_update = .{ .text = .{
+        .block_index = 0,
+        .delta = "second turn",
+    } } });
+    StreamSubscriber.onEvent(@ptrCast(&sub), .{ .message_end = .{
+        .role = .assistant,
+        .content = &.{},
+        .timestamp = 0,
+        .usage = .{ .input = 800, .output = 250 },
+    } });
+
+    try testing.expectEqual(@as(u64, 2000), sub.total_input);
+    try testing.expectEqual(@as(u64, 590), sub.total_output);
+    try testing.expectEqual(@as(u32, 2), sub.turn_count);
+
+    // Now post the summary.
+    sub.flushUsageSummary();
+
+    // Three posts total: 2 turn bubbles + 1 summary bubble.
+    try testing.expectEqual(@as(u32, 3), sub.post_count.load(.monotonic));
+    try testing.expect(s.post_bodies.items.len == 3);
+
+    const summary = s.post_bodies.items[2];
+    try testing.expect(std.mem.indexOf(u8, summary, "Token in: 2000") != null);
+    try testing.expect(std.mem.indexOf(u8, summary, "Token out: 590") != null);
+    try testing.expect(std.mem.indexOf(u8, summary, "Turns: 2") != null);
+    // Cache and cost are deliberately NOT in the summary.
+    try testing.expect(std.mem.indexOf(u8, summary, "cache") == null);
+    try testing.expect(std.mem.indexOf(u8, summary, "$") == null);
+}
+
+test "StreamSubscriber: flushUsageSummary is a no-op when no turn ran" {
+    // e.g. a setup error before agent.prompt — no `turn_start`,
+    // nothing to summarize, nothing to post.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{
+        .argv0 = .empty,
+        .environ = .empty,
+    });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var s = bindTallyServer(gpa, io) orelse return;
+    defer deinitTallyServer(&s);
+    const server_thread = try std.Thread.spawn(.{}, tallyServerLoop, .{&s});
+    defer {
+        s.stop.store(true, .release);
+        wakeServer(io, s.port);
+        server_thread.join();
+    }
+
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/", .{s.port});
+    defer gpa.free(base);
+
+    var api = web_api.Client.init(gpa, io, "xoxb-fake");
+    defer api.deinit();
+    api.base_url = base;
+
+    var sub = StreamSubscriber.init(gpa, io, &api, "C1", "9999.0001", .{});
+    defer sub.deinit();
+
+    sub.flushUsageSummary();
+
+    try testing.expectEqual(@as(u32, 0), sub.post_count.load(.monotonic));
 }

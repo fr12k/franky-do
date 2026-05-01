@@ -1,13 +1,16 @@
 .{
     .name = .franky_do,
     .fingerprint = 0x7b9341bbed601e6d,
-    .version = "0.5.1",
+    .version = "0.5.4",
     .minimum_zig_version = "0.17.0-dev",
     .dependencies = .{
         .franky = .{
-            .url = "https://github.com/fr12k/franky/archive/a88e483ce55a62493b3cb4cfb33aac117b57d5a6.tar.gz",
-            .hash = "franky-1.29.4-MZKCXXkaIwB5krUJ9G4UNDmHUFS1D_xSW9sUagtvVQVW",
+            .url = "https://github.com/fr12k/franky/archive/d24d9053947ab238fb85ef5f218c78128cdcb188.tar.gz",
+            .hash = "franky-1.29.6-MZKCXRtEIwBmHcyF_LazeQaUpZ6HLGoObryjJ2HG___E",
         },
+        // .franky = .{
+        //     .path = "../franky",
+        // },
         // WSS client for Slack Socket Mode. Pinned to a master commit
         // verified to build on Zig 0.17.0-dev.87+9b177a7d2 (31/31 of
         // its own tests pass on our toolchain). The `.hash` field is

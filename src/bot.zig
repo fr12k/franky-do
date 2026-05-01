@@ -18,14 +18,14 @@ const franky = @import("franky");
 const ai = franky.ai;
 const agent_mod = franky.agent;
 const at = agent_mod.types;
-const web_api = @import("slack/web_api.zig");
-const session_map = @import("session_map.zig");
-const agent_cache = @import("agent_cache.zig");
-const stream_sub_mod = @import("stream_subscriber.zig");
-const reactions_sub_mod = @import("reactions_subscriber.zig");
-const agent_hibernate_mod = @import("agent_hibernate.zig");
+const web_api = @import("slack/api.zig");
+const session_map = @import("session/manager.zig");
+const agent_cache = @import("session/agent_cache.zig");
+const stream_sub_mod = @import("subscribers/stream.zig");
+const reactions_sub_mod = @import("subscribers/reactions.zig");
+const agent_hibernate_mod = @import("session/hibernation.zig");
 const prompts_state = @import("prompts_state.zig");
-const slack_prompts = @import("slack_prompts.zig");
+const slack_prompts = @import("slack/prompts.zig");
 const session_mod = franky.coding.session;
 const permissions_mod = franky.coding.permissions;
 const stats_mod = @import("stats.zig");
@@ -525,6 +525,13 @@ pub const Bot = struct {
             sub.post_count.load(.monotonic), sub.posted_ts.items.len,
         });
 
+        // v0.5.2 — post the trailing usage summary
+        // (`_in: N · out: M · turns: K_`) BEFORE recording reply
+        // anchors so that bubble's `ts` also lands in `posted_ts`
+        // and gets anchored. No-op when `turn_count == 0`, which
+        // means the run never started.
+        sub.flushUsageSummary();
+
         // v0.5.0 — drain the subscriber's posted-ts list into the
         // reply-anchor cache. Each successfully-posted bubble
         // becomes a target for `:x:` (abort), `↩️` (retry), and
@@ -1008,6 +1015,12 @@ pub const Bot = struct {
             .session_dir = session_dir_full,
             .session_label = ulid,
             .mode_name = "franky-do",
+            // v0.5.3 — surface provider + model in the report
+            // header. Both are static for the bot lifetime
+            // (a single `cmdRun` invocation pins one provider +
+            // one model id), so reading from `cfg` is correct.
+            .provider = self.cfg.model_provider,
+            .model = self.cfg.model_id,
         };
         const persist_opts: ?franky.coding.diagnostics.PersistOptions = if (home_dir.len > 0) .{
             .franky_home = home_dir,
@@ -1694,24 +1707,35 @@ test "Bot.handleAppMention: end-to-end posts assistant text per message_end" {
     s.captures_mutex.lockUncancelable(io);
     defer s.captures_mutex.unlock(io);
     // v0.5.0 — no placeholder, no chat.update. The subscriber posts
-    // exactly one chat.postMessage per assistant message_end. Captures
-    // also include reactions.add (👀 received, 💭 working, ✅ done).
+    // exactly one chat.postMessage per assistant message_end.
+    // v0.5.2 — plus one trailing summary post (`_in: N · out: M ·
+    // turns: K_`) after the run goes idle. So a single-turn run
+    // produces exactly two `chat.postMessage` calls: the answer +
+    // the summary. Captures also include reactions.add (👀 / 💭 / ✅).
     var post_count: usize = 0;
     var assistant_post: ?usize = null;
+    var summary_post: ?usize = null;
     for (s.captures.items, 0..) |c, i| {
         if (std.mem.eql(u8, c.path, "/chat.postMessage")) {
             post_count += 1;
             if (std.mem.indexOf(u8, c.body, "hello there") != null) assistant_post = i;
+            if (std.mem.indexOf(u8, c.body, "Turns:") != null) summary_post = i;
         }
         // The streaming path no longer issues chat.update at all.
         try testing.expect(!std.mem.eql(u8, c.path, "/chat.update"));
     }
-    try testing.expectEqual(@as(usize, 1), post_count);
+    try testing.expectEqual(@as(usize, 2), post_count);
     try testing.expect(assistant_post != null);
+    try testing.expect(summary_post != null);
 
     const post = s.captures.items[assistant_post.?];
     try testing.expect(std.mem.indexOf(u8, post.body, "\"text\":\"hello there\"") != null);
     try testing.expect(std.mem.indexOf(u8, post.body, "\"thread_ts\":\"1700000000.000100\"") != null);
+
+    const summary = s.captures.items[summary_post.?];
+    try testing.expect(std.mem.indexOf(u8, summary.body, "Token in:") != null);
+    try testing.expect(std.mem.indexOf(u8, summary.body, "Token out:") != null);
+    try testing.expect(std.mem.indexOf(u8, summary.body, "Turns: 1") != null);
 
     // Also assert the three v0.3.0 emoji reactions landed in source order.
     var seen_eyes = false;

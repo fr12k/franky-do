@@ -16,7 +16,7 @@
 
 const std = @import("std");
 const ws = @import("websocket");
-const web_api = @import("web_api.zig");
+const web_api = @import("api.zig");
 
 /// Concrete handler type — `Handler` parameterized over `ws.Client`.
 /// The websocket library calls our `serverMessage` and `close`

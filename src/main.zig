@@ -9,23 +9,23 @@ const std = @import("std");
 const franky = @import("franky");
 const ws = @import("websocket");
 
-pub const slack = struct {
-    pub const web_api = @import("slack/web_api.zig");
-    pub const socket_mode = @import("slack/socket_mode.zig");
+const franky_do_slack = struct {
+    pub const web_api = @import("slack/api.zig");
+    pub const socket_mode = @import("slack/socket.zig");
 };
-pub const session_map = @import("session_map.zig");
-pub const agent_cache = @import("agent_cache.zig");
-pub const agent_hibernate = @import("agent_hibernate.zig");
+pub const session_map = @import("session/manager.zig");
+pub const agent_cache = @import("session/agent_cache.zig");
+pub const agent_hibernate = @import("session/hibernation.zig");
 pub const prompts_state = @import("prompts_state.zig");
-pub const slack_prompts = @import("slack_prompts.zig");
-pub const stream_subscriber = @import("stream_subscriber.zig");
-pub const reactions_subscriber = @import("reactions_subscriber.zig");
+pub const slack_prompts = @import("slack/prompts.zig");
+pub const stream_subscriber = @import("subscribers/stream.zig");
+pub const reactions_subscriber = @import("subscribers/reactions.zig");
 pub const bot = @import("bot.zig");
 pub const auth = @import("auth.zig");
 pub const pricing = @import("pricing.zig");
 pub const stats = @import("stats.zig");
 
-pub const version = "0.5.1";
+pub const version = "0.5.4";
 
 const usage =
     \\franky-do — Slack agent bot
@@ -339,8 +339,9 @@ fn cmdRun(
     // v0.3.5 — `model_id` is now resolved via the profile chain
     // below (`sub_cfg.model` precedence: --model arg > FRANKY_DO_MODEL
     // env > FRANKY_DO_PROFILE → profile.model > built-in default).
-    const prompts_enabled = resolvePromptsEnabled(environ_map, no_prompts_flag);
-    const ask_all = resolveAskAll(environ_map, ask_all_flag);
+    // `prompts_enabled` / `ask_all` are resolved inside
+    // `setupAndRunBot` from the same flags, so we don't compute
+    // them here.
 
     if (run_all) {
         // Logger already initialized at the top of cmdRun; runAll
@@ -427,6 +428,18 @@ fn cmdRun(
     ) catch "franky-do connected\n";
     try writeStderr(io, banner);
 
+    try setupAndRunBot(gpa, io, environ, environ_map, &api, bot_user_id, http_trace_dir_arg);
+}
+
+fn setupAndRunBot(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    environ: std.process.Environ,
+    environ_map: *std.process.Environ.Map,
+    api: *franky_do_slack.web_api.Client,
+    bot_user_id: []const u8,
+    http_trace_dir_arg: ?[]const u8,
+) !void {
     // ── 4. resolve provider via profile chain (v0.3.5) ──
     // Reads $FRANKY_DO_PROFILE → applies via franky's profile
     // system → resolveProviderIo returns provider_name + api_tag
@@ -434,11 +447,9 @@ fn cmdRun(
     // the profile's model).
     var sub_cfg: franky.coding.cli.Config = .{ .arena = std.heap.ArenaAllocator.init(gpa) };
     defer sub_cfg.deinit();
+
+    const model_arg = environ.getPosix("FRANKY_DO_MODEL");
     if (model_arg) |m| if (m.len > 0) {
-        sub_cfg.model = try sub_cfg.arena.allocator().dupe(u8, m);
-    };
-    const explicit_model = environ.getPosix("FRANKY_DO_MODEL");
-    if (sub_cfg.model == null) if (explicit_model) |m| if (m.len > 0) {
         sub_cfg.model = try sub_cfg.arena.allocator().dupe(u8, m);
     };
     const profile_name = environ.getPosix("FRANKY_DO_PROFILE");
@@ -489,15 +500,6 @@ fn cmdRun(
         franky.coding.tools.ls.tool(),
         franky.coding.tools.find.tool(),
         franky.coding.tools.grep.tool(),
-        // v0.5.1 — bash enabled. Stateless `bash.tool()` factory:
-        // no per-session cwd persistence, no workspace path-safety,
-        // spill files land in `/tmp/franky-bash-<call_id>.log`. The
-        // sole safety layer is the v0.4.4 Slack permission prompt
-        // (Block Kit ✅/❌ on every call). See §6.4 of the spec for
-        // the sandbox roadmap; until that lands, only enable
-        // `--ask-all=false` (i.e. the default) in trusted Slack
-        // workspaces — the model can `rm -rf` whatever the bot's
-        // UID can reach if an operator click-through misfires.
         franky.coding.tools.bash.tool(),
     };
     {
@@ -520,9 +522,6 @@ fn cmdRun(
     stream_opts.base_url = provider_info.base_url;
     stream_opts.environ_map = environ_map;
     stream_opts.timeouts = resolveTimeoutsFromEnv(environ_map);
-    // v0.4.7 — wire the HTTP trace dir. Pre-fix this was always
-    // null and operators couldn't capture provider request bodies
-    // for debugging the v1.29.0 empty_response cases.
     stream_opts.http_trace_dir = resolveHttpTraceDirFromEnv(environ_map, http_trace_dir_arg);
 
     franky.ai.log.log(.info, "franky-do", "model", "model_id={s} provider={s} api={s}", .{
@@ -539,21 +538,13 @@ fn cmdRun(
     } else {
         franky.ai.log.log(.debug, "franky-do", "http_trace", "disabled (set --http-trace-dir or FRANKY_DO_HTTP_TRACE_DIR to enable)", .{});
     }
-    var bot_inst = bot.Bot.init(gpa, io, &api, .{
+    var bot_inst = bot.Bot.init(gpa, io, api, .{
         .model_id = provider_info.model_id,
         .model_provider = provider_info.provider_name,
         .model_api = provider_info.api_tag,
         .model_context_window = provider_info.context_window,
         .model_max_output = provider_info.max_output,
         .model_capabilities = provider_info.capabilities,
-        // v0.2.1 — plain-text reply policy. Earlier versions tried to
-        // teach the model Slack's mrkdwn dialect (single-asterisk bold,
-        // no headings, …). Weak open-source models ignore the
-        // instructions and emit standard `**double**` / `### heading`
-        // markdown anyway, which Slack renders as literal punctuation.
-        // Plain text always renders correctly. Server-side
-        // markdown→mrkdwn translation is a v0.4 deferred item — see
-        // franky-do.md §16.2.
         .system_prompt =
         \\You are franky-do, a coding assistant in a Slack thread.
         \\Reply in plain text. Do not use markdown headings, asterisks
@@ -576,13 +567,11 @@ fn cmdRun(
     });
     defer bot_inst.deinit();
 
-    // v0.3.2 — wire the permission overlay. `prompts_enabled` is
-    // already resolved (CLI `--no-prompts` / env
-    // `FRANKY_DO_PROMPTS=0`). When enabled we allocate a single
-    // workspace-wide `Store`, optionally seeded from
-    // `$FRANKY_DO_HOME/permissions.json`, and hand its address to
-    // the bot. `ensureAgent` per-thread allocates its own
-    // `SessionGates` pointing at this Store.
+    const no_prompts_flag = false;
+    const ask_all_flag = false;
+    const prompts_enabled = resolvePromptsEnabled(environ_map, no_prompts_flag);
+    const ask_all = resolveAskAll(environ_map, ask_all_flag);
+
     bot_inst.prompts_enabled = prompts_enabled;
     var permission_store_owned: ?*franky.coding.permissions.Store = null;
     defer if (permission_store_owned) |s| freePermissionStore(gpa, s);
@@ -600,26 +589,18 @@ fn cmdRun(
         franky.ai.log.log(.info, "franky-do", "permissions", "prompts disabled (--no-prompts / FRANKY_DO_PROMPTS=0)", .{});
     }
 
-    // v0.3.3 — bot_user_id + per-prompt timeout. The bot uses
-    // bot_user_id to skip self-reactions on its own permission-
-    // prompt messages; the timeout drives the per-prompt
-    // auto-deny thread (default 10 min per design B.3.3).
     try bot_inst.setBotUserId(bot_user_id);
     bot_inst.prompt_timeout_ms = resolvePromptTimeoutMs(environ_map);
     if (prompts_enabled) {
         franky.ai.log.log(.info, "franky-do", "prompts", "prompt_timeout_ms={d}", .{bot_inst.prompt_timeout_ms});
     }
 
-    // v0.3.1 — apply hibernation knobs (cache cap + sweeper).
     const knobs = resolveHibernationKnobs(environ_map);
     bot_inst.agents.cap = knobs.cache_size;
     franky.ai.log.log(.info, "franky-do", "hibernation", "cache_size={d} idle_eviction_ms={d} sweeper_interval_ms={d}", .{
         knobs.cache_size, knobs.idle_eviction_ms, knobs.sweeper_interval_ms,
     });
 
-    // Spawn the sweeper. Ctrl-C / process exit flips `sweeper_stop`
-    // before `defer bot_inst.deinit()` so the sweeper joins cleanly
-    // before the bot starts persist-on-shutdown.
     var sweeper_stop = std.atomic.Value(bool).init(false);
     const sweeper_args: SweeperArgs = .{
         .bot_ptr = &bot_inst,
@@ -634,7 +615,7 @@ fn cmdRun(
     }
 
     // ── 6. socket mode + dispatcher wiring ──
-    var sm = franky_do_slack.socket_mode.SocketMode.init(gpa, io, &api);
+    var sm = franky_do_slack.socket_mode.SocketMode.init(gpa, io, api);
     defer sm.deinit();
 
     const Dispatch = struct {
@@ -692,10 +673,7 @@ fn cmdRun(
     };
 }
 
-const franky_do_slack = struct {
-    const web_api = @import("slack/web_api.zig");
-    const socket_mode = @import("slack/socket_mode.zig");
-};
+
 
 /// `--all` mode: enumerate installed workspaces, spawn a thread
 /// per workspace, each running its own socket-mode read loop.
@@ -800,191 +778,7 @@ fn runForInstalledWorkspace(
     defer auth_test_resp.deinit();
     const bot_user_id = auth_test_resp.value.user_id orelse "";
 
-    // v0.3.5 — same profile-driven provider resolution as cmdRun.
-    // `--all` has no per-workspace flag, so $FRANKY_DO_PROFILE +
-    // $FRANKY_DO_MODEL (env-only) drive the resolution.
-    var sub_cfg: franky.coding.cli.Config = .{ .arena = std.heap.ArenaAllocator.init(gpa) };
-    defer sub_cfg.deinit();
-    if (environ.getPosix("FRANKY_DO_MODEL")) |m| if (m.len > 0) {
-        sub_cfg.model = try sub_cfg.arena.allocator().dupe(u8, m);
-    };
-    if (environ.getPosix("FRANKY_DO_PROFILE")) |p| if (p.len > 0) {
-        franky.coding.profiles.applyProfile(&sub_cfg, io, environ_map, p) catch |e| switch (e) {
-            error.ProfileNotFound => {
-                franky.ai.log.log(.warn, "franky-do", "profile", "team={s} profile '{s}' not found; skipping workspace", .{ team_id, p });
-                return;
-            },
-            else => return e,
-        };
-    };
-    if (sub_cfg.model == null) {
-        sub_cfg.model = try sub_cfg.arena.allocator().dupe(u8, default_model_id);
-    }
-    const provider_info = franky.coding.modes.print.resolveProviderIo(gpa, io, environ, &sub_cfg) catch |e| {
-        franky.ai.log.log(.warn, "franky-do", "provider", "team={s} resolve failed: {s}", .{ team_id, @errorName(e) });
-        return;
-    };
-
-    var reg = franky.ai.registry.Registry.init(gpa);
-    defer reg.deinit();
-    try reg.register(.{
-        .api = "anthropic-messages",
-        .provider = "anthropic",
-        .stream_fn = franky.ai.providers.anthropic.streamFn,
-    });
-    try reg.register(.{
-        .api = "openai-chat-completions",
-        .provider = "openai",
-        .stream_fn = franky.ai.providers.openai_chat.streamFn,
-    });
-    try reg.register(.{
-        .api = "openai-compatible-gateway",
-        .provider = "gateway",
-        .stream_fn = franky.ai.providers.openai_gateway.streamFn,
-    });
-    try reg.register(.{
-        .api = "google-gemini",
-        .provider = "google-gemini",
-        .stream_fn = franky.ai.providers.google_gemini.streamFn,
-    });
-
-    const tools_arr = [_]franky.agent.types.AgentTool{
-        franky.coding.tools.read.tool(),
-        franky.coding.tools.write.tool(),
-        franky.coding.tools.edit.tool(),
-        franky.coding.tools.ls.tool(),
-        franky.coding.tools.find.tool(),
-        franky.coding.tools.grep.tool(),
-    };
-
-    var stream_opts: franky.ai.registry.StreamOptions = .{};
-    stream_opts.api_key = provider_info.api_key;
-    stream_opts.auth_token = provider_info.auth_token;
-    stream_opts.base_url = provider_info.base_url;
-    stream_opts.environ_map = environ_map;
-    stream_opts.timeouts = resolveTimeoutsFromEnv(environ_map);
-    // v0.4.7 — `--all` has no per-workspace flag surface; only the
-    // env var (`FRANKY_DO_HTTP_TRACE_DIR`) matters here.
-    stream_opts.http_trace_dir = resolveHttpTraceDirFromEnv(environ_map, null);
-
-    franky.ai.log.log(.info, "franky-do", "model", "team={s} model_id={s} provider={s} api={s}", .{
-        team_id, provider_info.model_id, provider_info.provider_name, provider_info.api_tag,
-    });
-    franky.ai.log.log(.info, "franky-do", "timeouts", "team={s} connect={d}ms upload={d}ms first_byte={d}ms event_gap={d}ms", .{
-        team_id,
-        stream_opts.timeouts.connect_ms,
-        stream_opts.timeouts.upload_ms,
-        stream_opts.timeouts.first_byte_ms,
-        stream_opts.timeouts.event_gap_ms,
-    });
-    if (stream_opts.http_trace_dir) |d| {
-        franky.ai.log.log(.info, "franky-do", "http_trace", "team={s} dir={s}", .{ team_id, d });
-    }
-
-    var bot_inst = bot.Bot.init(gpa, io, &api, .{
-        .model_id = provider_info.model_id,
-        .model_provider = provider_info.provider_name,
-        .model_api = provider_info.api_tag,
-        .model_context_window = provider_info.context_window,
-        .model_max_output = provider_info.max_output,
-        .model_capabilities = provider_info.capabilities,
-        .registry = &reg,
-        .tools = &tools_arr,
-        .stream_options = stream_opts,
-    });
-    defer bot_inst.deinit();
-
-    // v0.3.2 — same permission-overlay wiring as cmdRun. `--all`
-    // has no per-workspace CLI flag; resolution falls through to
-    // env (`FRANKY_DO_PROMPTS=0` to disable). `home` is already
-    // resolved by the caller, so we reuse it instead of looking
-    // it up again.
-    // v0.4.3 — `--all` likewise has no per-workspace `--ask-all`
-    // flag; only the env var (`FRANKY_DO_ASK_ALL=1`) matters here.
-    const prompts_enabled = resolvePromptsEnabled(environ_map, false);
-    const ask_all = resolveAskAll(environ_map, false);
-    bot_inst.prompts_enabled = prompts_enabled;
-    var permission_store_owned: ?*franky.coding.permissions.Store = null;
-    defer if (permission_store_owned) |s| freePermissionStore(gpa, s);
-    if (prompts_enabled) {
-        permission_store_owned = try initPermissionStore(gpa, io, environ_map, home, ask_all);
-        bot_inst.permission_store = permission_store_owned;
-        franky.ai.log.log(.info, "franky-do", "permissions", "team={s} store ready remember={s} ask_all={s} path={s}", .{
-            team_id,
-            if (resolveRememberPermissions(environ_map)) "yes" else "no",
-            if (ask_all) "yes" else "no",
-            permission_store_owned.?.persist_path orelse "(in-memory only)",
-        });
-    } else {
-        franky.ai.log.log(.info, "franky-do", "permissions", "team={s} prompts disabled (FRANKY_DO_PROMPTS=0)", .{team_id});
-    }
-
-    // v0.3.3 — same bot_user_id + prompt_timeout wiring as cmdRun.
-    try bot_inst.setBotUserId(bot_user_id);
-    bot_inst.prompt_timeout_ms = resolvePromptTimeoutMs(environ_map);
-    if (prompts_enabled) {
-        franky.ai.log.log(.info, "franky-do", "prompts", "team={s} prompt_timeout_ms={d}", .{ team_id, bot_inst.prompt_timeout_ms });
-    }
-
-    // v0.3.1 — same hibernation wiring as cmdRun.
-    const knobs = resolveHibernationKnobs(environ_map);
-    bot_inst.agents.cap = knobs.cache_size;
-    franky.ai.log.log(.info, "franky-do", "hibernation", "team={s} cache_size={d} idle_eviction_ms={d} sweeper_interval_ms={d}", .{
-        team_id, knobs.cache_size, knobs.idle_eviction_ms, knobs.sweeper_interval_ms,
-    });
-    var sweeper_stop = std.atomic.Value(bool).init(false);
-    const sweeper_args: SweeperArgs = .{
-        .bot_ptr = &bot_inst,
-        .interval_ms = knobs.sweeper_interval_ms,
-        .idle_ms = knobs.idle_eviction_ms,
-        .stop_flag = &sweeper_stop,
-    };
-    const sweeper_thread = try std.Thread.spawn(.{}, sweeperMain, .{sweeper_args});
-    defer {
-        sweeper_stop.store(true, .release);
-        sweeper_thread.join();
-    }
-
-    var sm = franky_do_slack.socket_mode.SocketMode.init(gpa, io, &api);
-    defer sm.deinit();
-
-    const Dispatch = struct {
-        bot_ptr: *bot.Bot,
-        bot_user_id_owned: []const u8,
-    };
-    const dispatch_state = try gpa.create(Dispatch);
-    defer gpa.destroy(dispatch_state);
-    const bot_user_id_dup = try gpa.dupe(u8, bot_user_id);
-    defer gpa.free(bot_user_id_dup);
-    dispatch_state.* = .{ .bot_ptr = &bot_inst, .bot_user_id_owned = bot_user_id_dup };
-
-    sm.on_event_userdata = @ptrCast(dispatch_state);
-    sm.on_event = struct {
-        fn cb(ud: ?*anyopaque, ev: franky_do_slack.socket_mode.InboundEvent) void {
-            const ds: *Dispatch = @ptrCast(@alignCast(ud.?));
-            franky.ai.log.log(.debug, "franky-do", "inbound", "type={s} envelope_id={s} bytes={d}", .{
-                @tagName(ev.type),
-                if (ev.envelope_id.len > 0) ev.envelope_id else "(none)",
-                ev.raw_json.len,
-            });
-            franky.ai.log.log(.trace, "franky-do", "inbound_raw", "{s}", .{ev.raw_json});
-            switch (ev.type) {
-                .events_api => ds.bot_ptr.dispatchSlackEvent(ds.bot_user_id_owned, ev.raw_json) catch |e|
-                    franky.ai.log.log(.warn, "franky-do", "dispatch", "events_api dispatch failed: {s}", .{@errorName(e)}),
-                .slash_commands => ds.bot_ptr.dispatchSlashCommand(ev.raw_json) catch |e|
-                    franky.ai.log.log(.warn, "franky-do", "dispatch", "slash_commands dispatch failed: {s}", .{@errorName(e)}),
-                .interactive => ds.bot_ptr.dispatchInteractive(ev.raw_json) catch |e|
-                    franky.ai.log.log(.warn, "franky-do", "dispatch", "interactive dispatch failed: {s}", .{@errorName(e)}),
-                else => franky.ai.log.log(.debug, "franky-do", "dispatch", "dropped: type={s}", .{@tagName(ev.type)}),
-            }
-        }
-    }.cb;
-
-    sm.connect() catch |e| {
-        franky.ai.log.log(.err, "franky-do", "connect", "{s}", .{@errorName(e)});
-        return;
-    };
-    sm.run() catch |e| franky.ai.log.log(.warn, "franky-do", "run", "read loop exited: {s}", .{@errorName(e)});
+    try setupAndRunBot(gpa, io, environ, environ_map, &api, bot_user_id, null);
 }
 
 /// `$FRANKY_DO_HOME` if set, else `$HOME/.franky-do`. Returned
@@ -1307,7 +1101,7 @@ test "phase 0: franky version is a non-empty string" {
 }
 
 test "phase 0: our own version constant is set" {
-    try testing.expectEqualStrings("0.5.1", version);
+    try testing.expectEqualStrings("0.5.4", version);
 }
 
 // ─── v0.4.3 — resolveAskAll precedence tests ──────────────────────
@@ -1390,8 +1184,8 @@ test "resolveHttpTraceDirFromEnv: empty flag + empty env → null" {
 
 // Pull in submodule tests via the public namespace.
 test {
-    _ = slack.web_api;
-    _ = slack.socket_mode;
+    _ = franky_do_slack.web_api;
+    _ = franky_do_slack.socket_mode;
     _ = session_map;
     _ = agent_cache;
     _ = agent_hibernate;
