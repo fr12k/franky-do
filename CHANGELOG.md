@@ -1,5 +1,180 @@
 # Changelog
 
+## [0.5.7] — 2026-04-29 — Critical/High audit follow-ups
+
+Continuation of the v0.5.6 zig-skill audit. Four more findings
+addressed; three audit claims confirmed wrong on cross-check
+(noted at the bottom).
+
+### `bot.zig` retry-path leak via `catch return` voiding errdefers
+
+`Bot.retryThread` (the `↩️` reaction handler) had its own
+copy of the `MentionWorkerArgs` build chain — six `try`-style
+dupes plus a `create(MentionWorkerArgs)` — but written as
+`catch return` instead of `try`. Since `retryThread` returns
+`void`, **`errdefer` does NOT fire on a plain `return`**
+(errdefer only fires on `!T`-returning paths). Net effect:
+if any dupe past the first one OOMs, every preceding dupe
+leaks. Symptom would have been ~60-200 bytes leaked per
+reaction-driven retry under memory pressure.
+
+**Fix:** extracted a shared `Bot.buildMentionWorkerArgs` +
+`Bot.freeMentionWorkerArgs` helper. Both `dispatchSlackEvent`
+(the `@`-mention path) and `retryThread` (the reaction path)
+now go through it. The builder uses `try` + `errdefer`
+internally so any partial failure is cleaned up regardless of
+whether the caller is an `!void` or `void` function. The
+`retryThread` site uses an explicit `freeMentionWorkerArgs`
+call after a `Thread.spawn` failure (since errdefer wouldn't
+fire from a `void` return).
+
+### `bot.zig` audit-line `chat.postMessage` silently dropped errors
+
+`if (self.api.chatPostMessage(.{...})) |r| { var rr = r; rr.deinit(); } else |_| {}`
+swallowed every error including OOM with no log. Replaced with
+the standard `var resp = ... catch |e| { log; return; }; defer
+resp.deinit();` shape; OOM / Slack outages now surface at warn.
+
+### `main.zig` `nanoSleepInterruptible` non-libc fallback was a busy-loop
+
+The `else` branch (no libc available) was a tight `while
+(now < deadline) {}` spin — same bug as the v0.5.6
+`Bot.deinit` busy-spin, just in a different file. Switched
+to `std.Thread.yield()` inside the deadline loop. Still no
+fixed sleep duration without libc, but yield gives up the
+time slice instead of pegging the core. (Realistic franky-do
+deployments link libc anyway, but the audit caught this as a
+copy of an already-fixed pattern — fixing it for symmetry.)
+
+### `subscribers/stream.zig` text_delta append silent OOM truncation
+
+`self.accumulated.appendSlice(self.allocator, t.delta) catch
+{};` silently dropped streamed bytes on OOM. Symptom: the
+user sees a Slack reply that ends mid-sentence with no error
+indicator. Now logs at `warn` with `accumulated_bytes` so
+operators can correlate the truncation with memory pressure.
+Stays best-effort — failing the whole turn would be worse
+UX than a slightly-truncated reply — but the signal is now
+visible.
+
+### Audit claims that were wrong on cross-check
+
+The agent's audit listed three more "Critical/High" items that
+turned out to be false positives:
+
+- **`Agent.abort` race in `bot.zig:1276-1277`** — claimed
+  `lastUserPrompt` reads the transcript without `waitForIdle`
+  after `abort()`. Cross-checked franky's `agent.zig:230-234`:
+  `pub fn abort(self: *Agent) void { ... t.join(); }`. abort
+  already joins. The existing comment was correct.
+- **`stats.zig:93-95`** — claimed `errdefer stats.deinit` was
+  dead code or leaked on append failure. Re-traced: errdefer
+  fires correctly on the `try result.append` error path
+  (alongside the outer errdefer on `result`). No leak.
+- **`stats.zig:127-128`** — claimed partial-construction leak
+  if `try allocator.dupe(u8, ulid)` fails inside the
+  `SessionStats{...}` literal. Re-traced: errdefer at line
+  128 fires on that error path, frees `model`. The success
+  path returns the struct with caller taking ownership.
+  No leak.
+
+Lesson: the zig-skill audit checklist is a strong filter,
+but every claim needs a cross-check before edit. Logged this
+in the skill's "When in doubt" section.
+
+**117/117 tests still pass.**
+
+## [0.5.6] — 2026-04-29 — Two anti-pattern fixes from a Zig audit pass
+
+A Zig-skill-driven audit of `src/` (using a fresh
+`~/.claude/skills/zig/` distilled from the pedropark99/zig-book)
+caught two real bugs hiding behind v0.5.x refactoring rot.
+
+### 1. `--no-prompts` and `--ask-all` CLI flags were silently ignored
+
+`cmdRun` parsed both flags from argv into `var no_prompts_flag`
+/ `var ask_all_flag` (lines 307, 312, 331, 333). Then it called
+`setupAndRunBot(...)` WITHOUT passing them. Inside
+`setupAndRunBot`, lines 570-571 re-declared the same identifiers
+as `const ... = false;` — silently shadowing the parsed flags.
+Net effect: `--no-prompts` and `--ask-all` on the CLI did
+nothing unless the env-var twins (`FRANKY_DO_PROMPTS=0` /
+`FRANKY_DO_ASK_ALL=1`) were also set.
+
+**Fix:** thread both flags through `setupAndRunBot`'s signature
+(`no_prompts_flag: bool`, `ask_all_flag: bool`); drop the
+shadowing `const` lines. The `runAll` caller passes
+`false, false` (per-workspace CLI flags aren't supported in
+`--all` mode by design — operators use the env-var twins
+instead).
+
+This was a pure regression: pre-reorg the flags were threaded
+correctly. The reorg moved the actual prompt/ask-all resolution
+into a new `setupAndRunBot` function but left the flag wiring
+behind. Local-shadowing-local is legal in Zig (no compiler
+warning), so the bug persisted across multiple v0.5.x cuts.
+
+### 2. `Bot.deinit` busy-spin pegged a CPU core during shutdown
+
+`bot.zig:166-169` had:
+
+```zig
+while (self.in_flight.load(.acquire) > 0) {
+    // 1 ms busy-spin is fine — workers are model calls
+    // measured in seconds, not microseconds.
+}
+```
+
+The comment lied: an empty `while` doesn't sleep, it spins. With
+a 30-second model call still in flight at shutdown, that's 30
+seconds of 100% CPU on one core. **Fix:** add a real 1 ms
+nanosleep inside the loop, libc-conditional with a
+`std.Thread.yield()` fallback (`std.Thread.sleep` is gone in
+0.17-dev — must go through `std.c.nanosleep` or
+`std.Io.Event.waitTimeout`).
+
+### Skill updates (`~/.claude/skills/zig/`)
+
+The audit also surfaced three patterns the skill didn't cover.
+Added a new "Concurrency footguns" section with:
+
+- **Wait loops MUST sleep** — empty `while (atomic.load() > 0) {}`
+  is a 100%-CPU bug. Show the libc-conditional sleep idiom and
+  flag that `std.Thread.sleep` is gone in 0.17-dev.
+- **`catch return` voids the entire `errdefer` chain** — Zig's
+  `errdefer` only fires on `!T`-returning paths. A `catch return`
+  in a `void`/non-error function silently skips every
+  preceding `errdefer`. Found 3+ instances in `bot.zig`'s retry
+  path (deferred to a separate task).
+- **Locals shadowed by same-name `const`s** — the
+  `--no-prompts` shadowing pattern. Local-shadowing-local is
+  legal; the compiler won't warn. When auditing, grep for
+  CLI-flag names re-declared mid-function.
+
+### Audit findings deferred to separate work
+
+Documented in audit but not fixed in v0.5.6 (require design
+judgment or larger refactor):
+
+- `stats.zig:93-95, 127-128` — partial-construction leaks in
+  `cmdStats` (read-only path, OOM here non-catastrophic).
+- `bot.zig:1290-1293` — silent `if (chatPostMessage()) |r| {…}
+  else |_| {}` swallows OOM with no log.
+- `bot.zig:1300-1336` — `retryThread` duplicates the
+  `MentionWorkerArgs` build pattern AND uses `catch return`
+  voiding the errdefer chain. Fix is an extraction, not a
+  patch.
+- `bot.zig:1276-1277` — `lastUserPrompt` reads
+  `agent.transcript.messages.items` without `waitForIdle` after
+  `abort()`. Race with the agent worker.
+- `subscribers/stream.zig:132` — `appendSlice catch {}` silently
+  truncates streamed text on OOM.
+- `main.zig:880-895` — `nanoSleepInterruptible`'s non-libc
+  fallback is the same busy-loop pattern just fixed in
+  `Bot.deinit`. Same fix shape applies.
+
+**117/117 tests pass.**
+
 ## [0.5.5] — 2026-04-29 — Fix proxy-arena leak (franky v1.29.7 lockstep)
 
 Pairs with **franky v1.29.7**, which closes the v1.29.4

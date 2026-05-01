@@ -1,7 +1,7 @@
 .{
     .name = .franky_do,
     .fingerprint = 0x7b9341bbed601e6d,
-    .version = "0.5.5",
+    .version = "0.5.7",
     .minimum_zig_version = "0.17.0-dev",
     .dependencies = .{
         .franky = .{

@@ -163,9 +163,19 @@ pub const Bot = struct {
         // Block until every detached mention worker has exited.
         // Without this, the workers race against `agents.deinit()`
         // freeing the agent they're prompting.
+        // v0.5.6 — actually sleep inside the loop. The "1 ms
+        // busy-spin is fine" comment lied: an empty `while`
+        // pegs a CPU core during shutdown until the last worker
+        // returns (model calls measured in seconds). On libc
+        // builds we nanosleep 1 ms; otherwise fall back to a
+        // thread yield (still better than the empty loop).
         while (self.in_flight.load(.acquire) > 0) {
-            // 1 ms busy-spin is fine — workers are model calls
-            // measured in seconds, not microseconds.
+            if (@import("builtin").link_libc) {
+                const ts = std.c.timespec{ .sec = 0, .nsec = 1_000_000 };
+                _ = std.c.nanosleep(&ts, null);
+            } else {
+                std.Thread.yield() catch {};
+            }
         }
 
         // v0.3.1 — graceful shutdown persistence. Drain the cache,
@@ -615,32 +625,19 @@ pub const Bot = struct {
         const thread_ts = if (ev.thread_ts.len > 0) ev.thread_ts else ev.ts;
         const stripped = stripMentionPrefix(ev.text, bot_user_id);
 
-        // Make owned copies — the parsed JSON is freed before the
-        // worker thread reads them.
-        const team_owned = try self.allocator.dupe(u8, team_id);
-        errdefer self.allocator.free(team_owned);
-        const channel_owned = try self.allocator.dupe(u8, channel);
-        errdefer self.allocator.free(channel_owned);
-        const thread_owned = try self.allocator.dupe(u8, thread_ts);
-        errdefer self.allocator.free(thread_owned);
-        const text_owned = try self.allocator.dupe(u8, stripped);
-        errdefer self.allocator.free(text_owned);
-        const user_ts_owned = try self.allocator.dupe(u8, ev.ts);
-        errdefer self.allocator.free(user_ts_owned);
-        const mentioner_owned = try self.allocator.dupe(u8, ev.user);
-        errdefer self.allocator.free(mentioner_owned);
-
-        const args = try self.allocator.create(MentionWorkerArgs);
-        errdefer self.allocator.destroy(args);
-        args.* = .{
-            .bot = self,
-            .team_id = team_owned,
-            .channel = channel_owned,
-            .thread_ts = thread_owned,
-            .text = text_owned,
-            .user_message_ts = user_ts_owned,
-            .mentioner_user_id = mentioner_owned,
-        };
+        // v0.5.7 — both this site and `retryThread` go through the
+        // shared builder; centralizing the dupe + alloc chain in one
+        // place avoids `catch return`-voids-errdefer bugs (which is
+        // exactly what `retryThread` had before the refactor).
+        const args = try self.buildMentionWorkerArgs(
+            team_id,
+            channel,
+            thread_ts,
+            stripped,
+            ev.ts,
+            ev.user,
+        );
+        errdefer self.freeMentionWorkerArgs(args);
 
         // Bump in-flight before spawning so deinit blocks correctly
         // even if the worker hasn't started yet.
@@ -1289,8 +1286,12 @@ pub const Bot = struct {
             .thread_ts = thread_ts,
         })) |r| {
             var rr = r;
-            rr.deinit();
-        } else |_| {}
+            defer rr.deinit();
+        } else |e| {
+            // Best-effort audit line; failure here doesn't block the
+            // retry itself, but log so OOM / Slack outages are visible.
+            franky.ai.log.log(.warn, "franky-do", "retry", "audit chat.postMessage failed: {s}", .{@errorName(e)});
+        }
 
         // Step 3: replay through `mentionWorker` so the in-flight
         // counter + subscriber + chat.postMessage flow stay
@@ -1298,27 +1299,84 @@ pub const Bot = struct {
         // ends up with the user prompt repeated; that's tolerable
         // for v0.1 and avoids hand-rolled truncation that could
         // leak content blocks.
-        const team_owned = self.allocator.dupe(u8, team_id) catch return;
-        errdefer self.allocator.free(team_owned);
-        const channel_owned = self.allocator.dupe(u8, channel) catch return;
-        errdefer self.allocator.free(channel_owned);
-        const thread_owned = self.allocator.dupe(u8, thread_ts) catch return;
-        errdefer self.allocator.free(thread_owned);
-        const text_owned = self.allocator.dupe(u8, last_text) catch return;
-        errdefer self.allocator.free(text_owned);
-        // v0.3.0 — retry has no original-mention `ts` in scope; react
-        // on the thread root instead (which IS the original mention
-        // for top-level threads, and is at least visible in the
-        // sidebar for nested ones).
-        const user_ts_owned = self.allocator.dupe(u8, thread_ts) catch return;
-        errdefer self.allocator.free(user_ts_owned);
-        // v0.3.3 — retry runs as the user who reacted. They get
+        //
+        // v0.5.7 — pre-fix this had its own dupe + alloc chain
+        // using `catch return`, which voided every preceding
+        // `errdefer` (errdefer only fires on `!T` returns; a
+        // plain `return` from a `void` function does NOT trigger
+        // it). Result: a partial dupe failure leaked all earlier
+        // dupes. Now both this site and `dispatchSlackEvent` go
+        // through `buildMentionWorkerArgs`, which uses `try` +
+        // errdefer correctly internally.
+        //
+        // v0.3.0 — retry has no original-mention `ts` in scope;
+        // react on the thread root (which IS the original mention
+        // for top-level threads, visible in the sidebar for
+        // nested ones).
+        // v0.3.3 — retry runs as the user who reacted; they get
         // ownership of any new permission prompts.
-        const mentioner_owned = self.allocator.dupe(u8, reactor) catch return;
+        const args = self.buildMentionWorkerArgs(
+            team_id,
+            channel,
+            thread_ts,
+            last_text,
+            thread_ts,
+            reactor,
+        ) catch |e| {
+            franky.ai.log.log(.warn, "franky-do", "retry", "buildMentionWorkerArgs failed: {s}", .{@errorName(e)});
+            return;
+        };
+
+        _ = self.in_flight.fetchAdd(1, .acq_rel);
+        const t = std.Thread.spawn(.{}, mentionWorker, .{args}) catch |e| {
+            _ = self.in_flight.fetchSub(1, .acq_rel);
+            // void function — `errdefer` wouldn't fire on `return`.
+            // Free explicitly so the args don't leak.
+            self.freeMentionWorkerArgs(args);
+            franky.ai.log.log(.warn, "franky-do", "retry", "Thread.spawn failed: {s}", .{@errorName(e)});
+            return;
+        };
+        t.detach();
+    }
+
+    /// v0.5.7 — shared builder for `dispatchSlackEvent` +
+    /// `retryThread`. Dupes every borrowed slice, allocates the
+    /// args struct, populates it. On any allocation failure the
+    /// partial state is torn down via internal `errdefer` chain
+    /// (using `try` so errdefer actually fires) — caller never
+    /// sees a half-built args.
+    ///
+    /// Caller MUST EITHER:
+    ///   - hand `args` to `Thread.spawn(mentionWorker, .{args})`
+    ///     (mentionWorker's `defer` cleanup owns + frees on exit),
+    ///     OR
+    ///   - call `freeMentionWorkerArgs(args)` to release.
+    ///
+    /// `in_flight` is NOT bumped here — caller bumps right before
+    /// spawn so a spawn failure can decrement.
+    fn buildMentionWorkerArgs(
+        self: *Bot,
+        team_id: []const u8,
+        channel: []const u8,
+        thread_ts: []const u8,
+        text: []const u8,
+        user_message_ts: []const u8,
+        mentioner_user_id: []const u8,
+    ) !*MentionWorkerArgs {
+        const team_owned = try self.allocator.dupe(u8, team_id);
+        errdefer self.allocator.free(team_owned);
+        const channel_owned = try self.allocator.dupe(u8, channel);
+        errdefer self.allocator.free(channel_owned);
+        const thread_owned = try self.allocator.dupe(u8, thread_ts);
+        errdefer self.allocator.free(thread_owned);
+        const text_owned = try self.allocator.dupe(u8, text);
+        errdefer self.allocator.free(text_owned);
+        const user_ts_owned = try self.allocator.dupe(u8, user_message_ts);
+        errdefer self.allocator.free(user_ts_owned);
+        const mentioner_owned = try self.allocator.dupe(u8, mentioner_user_id);
         errdefer self.allocator.free(mentioner_owned);
 
-        const args = self.allocator.create(MentionWorkerArgs) catch return;
-        errdefer self.allocator.destroy(args);
+        const args = try self.allocator.create(MentionWorkerArgs);
         args.* = .{
             .bot = self,
             .team_id = team_owned,
@@ -1328,12 +1386,21 @@ pub const Bot = struct {
             .user_message_ts = user_ts_owned,
             .mentioner_user_id = mentioner_owned,
         };
-        _ = self.in_flight.fetchAdd(1, .acq_rel);
-        const t = std.Thread.spawn(.{}, mentionWorker, .{args}) catch {
-            _ = self.in_flight.fetchSub(1, .acq_rel);
-            return;
-        };
-        t.detach();
+        return args;
+    }
+
+    /// v0.5.7 — mirror of the `defer` block in `mentionWorker`,
+    /// minus the `in_flight` decrement. Use when the worker
+    /// doesn't run (e.g. `Thread.spawn` failure) so the dupes +
+    /// args struct don't leak.
+    fn freeMentionWorkerArgs(self: *Bot, args: *MentionWorkerArgs) void {
+        self.allocator.free(args.team_id);
+        self.allocator.free(args.channel);
+        self.allocator.free(args.thread_ts);
+        self.allocator.free(args.text);
+        self.allocator.free(args.user_message_ts);
+        self.allocator.free(args.mentioner_user_id);
+        self.allocator.destroy(args);
     }
 };
 

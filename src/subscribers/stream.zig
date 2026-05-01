@@ -129,7 +129,14 @@ pub const StreamSubscriber = struct {
             .message_update => |u| switch (u) {
                 .text => |t| {
                     ai.log.log(.trace, "franky-do", "stream_event", "text_delta block={d} bytes={d}", .{ t.block_index, t.delta.len });
-                    self.accumulated.appendSlice(self.allocator, t.delta) catch {};
+                    // v0.5.7 — best-effort, but log on OOM so the
+                    // operator sees why a Slack reply ends up
+                    // truncated mid-sentence. Pre-fix this was
+                    // `catch {}` and the user would just see a
+                    // half-delivered response with no signal.
+                    self.accumulated.appendSlice(self.allocator, t.delta) catch |e| {
+                        ai.log.log(.warn, "franky-do", "stream", "text_delta append failed: {s} (response will be truncated, accumulated={d}B)", .{ @errorName(e), self.accumulated.items.len });
+                    };
                 },
                 .thinking => |t| ai.log.log(.trace, "franky-do", "stream_event", "thinking_delta block={d} bytes={d}", .{ t.block_index, t.delta.len }),
                 .toolcall_args => |t| ai.log.log(.trace, "franky-do", "stream_event", "toolcall_args block={d} bytes={d}", .{ t.block_index, t.delta.len }),

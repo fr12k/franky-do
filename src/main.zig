@@ -25,7 +25,7 @@ pub const auth = @import("auth.zig");
 pub const pricing = @import("pricing.zig");
 pub const stats = @import("stats.zig");
 
-pub const version = "0.5.5";
+pub const version = "0.5.7";
 
 const usage =
     \\franky-do — Slack agent bot
@@ -428,7 +428,7 @@ fn cmdRun(
     ) catch "franky-do connected\n";
     try writeStderr(io, banner);
 
-    try setupAndRunBot(gpa, io, environ, environ_map, &api, bot_user_id, http_trace_dir_arg);
+    try setupAndRunBot(gpa, io, environ, environ_map, &api, bot_user_id, http_trace_dir_arg, no_prompts_flag, ask_all_flag);
 }
 
 fn setupAndRunBot(
@@ -439,6 +439,14 @@ fn setupAndRunBot(
     api: *franky_do_slack.web_api.Client,
     bot_user_id: []const u8,
     http_trace_dir_arg: ?[]const u8,
+    // v0.5.6 — CLI flags threaded through. Pre-fix these were
+    // shadowed by `const … = false;` declarations inside the body
+    // (refactor rot from an earlier extraction); both
+    // `--no-prompts` and `--ask-all` were silently ignored unless
+    // their env-var twins (`FRANKY_DO_PROMPTS=0`,
+    // `FRANKY_DO_ASK_ALL=1`) were also set.
+    no_prompts_flag: bool,
+    ask_all_flag: bool,
 ) !void {
     // ── 4. resolve provider via profile chain (v0.3.5) ──
     // Reads $FRANKY_DO_PROFILE → applies via franky's profile
@@ -567,8 +575,9 @@ fn setupAndRunBot(
     });
     defer bot_inst.deinit();
 
-    const no_prompts_flag = false;
-    const ask_all_flag = false;
+    // v0.5.6 — flags arrive as parameters from cmdRun's argv parse.
+    // Env vars (`FRANKY_DO_PROMPTS=0`, `FRANKY_DO_ASK_ALL=1`) remain
+    // the secondary signal inside the resolvers.
     const prompts_enabled = resolvePromptsEnabled(environ_map, no_prompts_flag);
     const ask_all = resolveAskAll(environ_map, ask_all_flag);
 
@@ -778,7 +787,11 @@ fn runForInstalledWorkspace(
     defer auth_test_resp.deinit();
     const bot_user_id = auth_test_resp.value.user_id orelse "";
 
-    try setupAndRunBot(gpa, io, environ, environ_map, &api, bot_user_id, null);
+    // v0.5.6 — `--all` runs each workspace as a sub-process via
+    // env-only configuration; per-workspace CLI flags are not
+    // supported here, so pass false/false. Operators set
+    // `FRANKY_DO_PROMPTS=0` / `FRANKY_DO_ASK_ALL=1` to opt out.
+    try setupAndRunBot(gpa, io, environ, environ_map, &api, bot_user_id, null, false, false);
 }
 
 /// `$FRANKY_DO_HOME` if set, else `$HOME/.franky-do`. Returned
@@ -890,9 +903,19 @@ fn nanoSleepInterruptible(ms: u64, stop_flag: *std.atomic.Value(bool)) void {
             };
             _ = std.c.nanosleep(&ts, null);
         } else {
+            // v0.5.7 — non-libc fallback used to be a tight
+            // `while (now < deadline) {}` busy-loop, pegging a
+            // CPU core for the full sleep window. `Thread.yield`
+            // is a coarse-grained scheduler hint (no fixed
+            // duration), but it gives up the time slice instead
+            // of spinning. Wrap in the same deadline so we still
+            // wake near `this_slice` ms.
             const start = franky.ai.stream.nowMillis();
             const deadline = start + @as(i64, @intCast(this_slice));
-            while (franky.ai.stream.nowMillis() < deadline) {}
+            while (franky.ai.stream.nowMillis() < deadline) {
+                std.Thread.yield() catch break;
+                if (stop_flag.load(.acquire)) break;
+            }
         }
         remaining -|= this_slice;
     }
@@ -1101,7 +1124,7 @@ test "phase 0: franky version is a non-empty string" {
 }
 
 test "phase 0: our own version constant is set" {
-    try testing.expectEqualStrings("0.5.5", version);
+    try testing.expectEqualStrings("0.5.7", version);
 }
 
 // ─── v0.4.3 — resolveAskAll precedence tests ──────────────────────
