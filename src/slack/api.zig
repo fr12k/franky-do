@@ -172,7 +172,7 @@ pub const Client = struct {
         // v0.3.9/v0.4.0 — proxy + FRANKY_CA_BUNDLE in one call.
         // Same helper the LLM providers use (franky v1.25.0).
         if (self.environ_map) |env_map| {
-            proxy_arena = http.setupClientFromEnv(&http_client, self.allocator, self.io, env_map) catch |e| {
+            proxy_arena = http.setupClientFromEnv(&http_client, self.allocator, env_map) catch |e| {
                 self.last_http_error = e;
                 return ApiError.HttpFailed;
             };
@@ -571,7 +571,7 @@ pub const Client = struct {
         // upload step too; the presigned URL host hits the same
         // MITM proxy as the /api/* endpoints.
         if (self.environ_map) |env_map| {
-            proxy_arena = http.setupClientFromEnv(&http_client, self.allocator, self.io, env_map) catch |e| {
+            proxy_arena = http.setupClientFromEnv(&http_client, self.allocator, env_map) catch |e| {
                 self.last_http_error = e;
                 return ApiError.HttpFailed;
             };

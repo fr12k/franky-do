@@ -25,7 +25,39 @@ pub const auth = @import("auth.zig");
 pub const pricing = @import("pricing.zig");
 pub const stats = @import("stats.zig");
 
-pub const version = "0.5.7";
+pub const version = "0.5.8";
+
+/// v0.5.8 — global pointer to the active SocketMode, so the
+/// SIGINT/SIGTERM handler can set `graceful_stop` to break the
+/// reconnection loop. Set right before the loop in
+/// `setupAndRunBot`; cleared on exit. The handler only writes a
+/// release-store to an atomic bool, which is async-signal-safe.
+/// v0.5.8 — the reconnect loop checks both the per-SocketMode
+/// `graceful_stop` AND this global on each iteration. The signal
+/// handler sets the global and closes the WSS socket via the
+/// `g_socket_mode` pointer so `run()` returns promptly.
+///
+/// In `--all` multi-workspace mode `g_socket_mode` points at
+/// whichever worker set it last, so at most one workspace thread
+/// is woken directly by the handler. The others detect
+/// `g_graceful_stop` on their next sleep iteration and exit.
+var g_graceful_stop: std.atomic.Value(bool) = .init(false);
+var g_socket_mode: ?*franky_do_slack.socket_mode.SocketMode = null;
+
+/// v0.5.8 — SIGINT / SIGTERM handler. Sets the global stop flag
+/// and closes the WSS socket so `run()` returns. The reconnect
+/// loop in each workspace thread detects `g_graceful_stop` and
+/// exits. Async-signal-safe: atomic stores + socket close only.
+fn signalHandler(signo: std.posix.SIG) callconv(.c) void {
+    _ = signo;
+    g_graceful_stop.store(true, .release);
+    if (g_socket_mode) |sm| {
+        sm.graceful_stop.store(true, .release);
+        if (sm.client) |c| {
+            c.close(.{}) catch {};
+        }
+    }
+}
 
 const usage =
     \\franky-do — Slack agent bot
@@ -448,6 +480,12 @@ fn setupAndRunBot(
     no_prompts_flag: bool,
     ask_all_flag: bool,
 ) !void {
+    // v0.5.8 — install SIGINT/SIGTERM handler so Ctrl-C sets
+    // `graceful_stop` and breaks the reconnect loop. Best-effort:
+    // on non-POSIX (Windows) the handler is a no-op and the
+    // reconnect loop exits only when the WSS stays down.
+    installSignalHandler();
+
     // ── 4. resolve provider via profile chain (v0.3.5) ──
     // Reads $FRANKY_DO_PROFILE → applies via franky's profile
     // system → resolveProviderIo returns provider_name + api_tag
@@ -654,32 +692,83 @@ fn setupAndRunBot(
                     franky.ai.log.log(.warn, "franky-do", "dispatch", "slash_commands dispatch failed: {s}", .{@errorName(e)}),
                 .interactive => ds.bot_ptr.dispatchInteractive(ev.raw_json) catch |e|
                     franky.ai.log.log(.warn, "franky-do", "dispatch", "interactive dispatch failed: {s}", .{@errorName(e)}),
+                .disconnect => franky.ai.log.log(.info, "franky-do", "wss", "received disconnect event from Slack — expecting WSS close", .{}),
                 else => franky.ai.log.log(.debug, "franky-do", "dispatch", "dropped: type={s}", .{@tagName(ev.type)}),
             }
         }
     }.cb;
 
-    // ── 7. open WSS, run loop ──
-    sm.connect() catch |e| {
-        var msg_buf: [256]u8 = undefined;
-        const msg = std.fmt.bufPrint(
-            &msg_buf,
-            "run: socket mode connect failed: {s}\n",
-            .{@errorName(e)},
-        ) catch "run: socket mode connect failed\n";
-        try writeStderr(io, msg);
-        std.process.exit(2);
-    };
-    try writeStderr(io, "franky-do listening on Slack Socket Mode (Ctrl-C to quit)\n");
-    sm.run() catch |e| {
-        var msg_buf: [256]u8 = undefined;
-        const msg = std.fmt.bufPrint(
-            &msg_buf,
-            "run: read loop exited: {s}\n",
-            .{@errorName(e)},
-        ) catch "run: read loop exited\n";
-        try writeStderr(io, msg);
-    };
+    // ── 7. reconnect loop: open WSS, run until disconnect, retry ──
+    // v0.5.8 — wraps `sm.connect()` + `sm.run()` in a retry loop
+    // with exponential backoff. The Bot + sweeper live OUTSIDE this
+    // loop; only the SocketMode + ws.Client are recycled. Ctrl-C
+    // sets `g_graceful_stop` via the signal handler; the loop checks
+    // both the per-SocketMode AND the global flag on every iteration
+    // so `--all` workers eventually detect it too.
+    g_socket_mode = &sm;
+    defer g_socket_mode = null;
+
+    var retry_delay_ms: u64 = 1000;
+    const max_retry_ms: u64 = 60_000;
+    var first_connect = true;
+
+    while (!sm.graceful_stop.load(.acquire) and !g_graceful_stop.load(.acquire)) {
+        // Reset the disconnected flag before each connect attempt.
+        sm.disconnected.store(false, .release);
+
+        // Step 1: get a fresh WSS URL from Slack
+        // (Slack rotates tickets on reconnect).
+        sm.refreshWssUrl() catch |e| {
+            franky.ai.log.log(.warn, "franky-do", "wss", "refreshWssUrl failed: {s} — retrying in {d}ms", .{
+                @errorName(e), retry_delay_ms,
+            });
+            if (sm.graceful_stop.load(.acquire) or g_graceful_stop.load(.acquire)) break;
+            nanoSleepInterruptible(retry_delay_ms, &sm.graceful_stop);
+            retry_delay_ms = @min(retry_delay_ms * 2, max_retry_ms);
+            continue;
+        };
+        retry_delay_ms = 1000;
+
+        // Step 2: open the WSS connection.
+        sm.connect() catch |e| {
+            franky.ai.log.log(.warn, "franky-do", "wss", "connect failed: {s} — retrying in {d}ms", .{
+                @errorName(e), retry_delay_ms,
+            });
+            if (sm.graceful_stop.load(.acquire) or g_graceful_stop.load(.acquire)) break;
+            nanoSleepInterruptible(retry_delay_ms, &sm.graceful_stop);
+            retry_delay_ms = @min(retry_delay_ms * 2, max_retry_ms);
+            continue;
+        };
+        retry_delay_ms = 1000;
+
+        if (first_connect) {
+            try writeStderr(io, "franky-do listening on Slack Socket Mode (Ctrl-C to quit)\n");
+            first_connect = false;
+        } else {
+            franky.ai.log.log(.info, "franky-do", "wss", "reconnected to Slack Socket Mode", .{});
+        }
+
+        // Step 3: block until the connection drops.
+        // `sm.run()` returns when the WSS read loop exits
+        // (clean disconnect, network error, or signal).
+        sm.run() catch |e| {
+            franky.ai.log.log(.warn, "franky-do", "wss", "read loop exited: {s}", .{@errorName(e)});
+        };
+
+        // Step 4: close the stale ws.Client + handler.
+        // `sm.close()` is idempotent — it tears down the
+        // underlying ws.Client (including closing the socket).
+        sm.close();
+
+        if (sm.graceful_stop.load(.acquire) or g_graceful_stop.load(.acquire)) {
+            franky.ai.log.log(.info, "franky-do", "wss", "graceful stop requested — exiting reconnect loop", .{});
+            break;
+        }
+
+        franky.ai.log.log(.warn, "franky-do", "wss", "connection dropped — reconnecting in {d}ms", .{retry_delay_ms});
+        nanoSleepInterruptible(retry_delay_ms, &sm.graceful_stop);
+        retry_delay_ms = @min(retry_delay_ms * 2, max_retry_ms);
+    }
 }
 
 
@@ -921,6 +1010,24 @@ fn nanoSleepInterruptible(ms: u64, stop_flag: *std.atomic.Value(bool)) void {
     }
 }
 
+/// v0.5.8 — install SIGINT + SIGTERM handlers that set
+/// `g_socket_mode.graceful_stop` and close the WSS socket
+/// so the reconnect loop breaks on Ctrl-C. Best-effort on
+/// non-POSIX (Windows) — the handler is a no-op there and
+/// the reconnect loop exits only when the WSS stays down
+/// indefinitely (which requires a process kill).
+fn installSignalHandler() void {
+    if (@import("builtin").os.tag == .windows) return;
+    const posix = std.posix;
+    var sa: posix.Sigaction = .{
+        .handler = .{ .handler = signalHandler },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.INT, &sa, null);
+    posix.sigaction(posix.SIG.TERM, &sa, null);
+}
+
 /// Built-in default model id, used when no `--model` flag and no
 /// `FRANKY_DO_MODEL` env var is set.
 const default_model_id: []const u8 = "claude-sonnet-4-5";
@@ -1124,7 +1231,7 @@ test "phase 0: franky version is a non-empty string" {
 }
 
 test "phase 0: our own version constant is set" {
-    try testing.expectEqualStrings("0.5.7", version);
+    try testing.expectEqualStrings("0.5.8", version);
 }
 
 // ─── v0.4.3 — resolveAskAll precedence tests ──────────────────────

@@ -60,7 +60,6 @@ oauth_config:
       - im:history
       - im:read
       - reactions:read
-      # v0.3.0 — needed for emoji status indicators on the user's
       # @-mention message (👀 received / 💭 working / ✅ done / ❌ error).
       # Requires app reinstall when upgrading from v0.2.x.
       - reactions:write

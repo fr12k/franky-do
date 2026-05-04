@@ -190,6 +190,14 @@ pub const SocketMode = struct {
     /// Whether `start` has been called and the read loop is up.
     /// Tests inspect this; production toggles via `start`/`close`.
     is_running: std.atomic.Value(bool) = .init(false),
+    /// Set by `Handler.close` when the underlying WSS drops.
+    /// The reconnect loop in `main.zig` reads this to distinguish
+    /// a dropped connection from a graceful stop.
+    disconnected: std.atomic.Value(bool) = .init(false),
+    /// When true, the reconnect loop should NOT reconnect — the
+    /// process is shutting down (SIGINT/SIGTERM). Set by the
+    /// signal handler in `main.zig`.
+    graceful_stop: std.atomic.Value(bool) = .init(false),
     /// Heap-allocated ws client. Lives across the connect/run/close
     /// lifecycle. `connect` creates it; `close` deinits + frees.
     client: ?*ws.Client = null,
@@ -317,6 +325,7 @@ pub fn Handler(comptime ClientT: type) type {
         pub fn close(self: *Self) void {
             self.closed.store(true, .release);
             self.sm.is_running.store(false, .release);
+            self.sm.disconnected.store(true, .release);
         }
     };
 }
